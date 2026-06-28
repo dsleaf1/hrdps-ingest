@@ -1,0 +1,36 @@
+name: HRDPS 2.5 km ingest
+
+on:
+  schedule:
+    # ~1 h after each HRDPS run publishes (runs 00/06/12/18Z land ~+3.5 h)
+    - cron: "5 5,11,17,23 * * *"
+  workflow_dispatch: {}        # allows manual "Run workflow" for testing
+
+concurrency:
+  group: hrdps-ingest
+  cancel-in-progress: false
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install eccodes (GRIB2 decoder)
+        run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-dev
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Run ingest
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python ingest.py

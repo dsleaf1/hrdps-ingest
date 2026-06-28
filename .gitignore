@@ -1,0 +1,7 @@
+out/
+*.grib2
+*.idx
+__pycache__/
+*.pyc
+.DS_Store
+.venv/
