@@ -217,6 +217,14 @@ def main():
         json.dump(manifest, open("out/manifest.json", "w"), indent=2)
         for k in keys: open(f"out/{k}.bin", "wb").write(bytes(buffers[k]))
         log("Wrote ./out (manifest.json + region .bin files)")
+        # sanity stats on the last ingested hour, to confirm the decode is reasonable
+        for k in keys:
+            n = interps[k]["cols"] * interps[k]["rows"]
+            spd = np.frombuffer(bytes(buffers[k][-2 * n:-n]), dtype="uint8").astype("float32")
+            ok = spd[spd != 255]
+            if ok.size:
+                log(f"  STATS {k}: {ok.size}/{n} valid cells | speed km/h min={ok.min():.0f} "
+                    f"mean={ok.mean():.0f} max={ok.max():.0f}")
     else:
         c = r2_client()
         r2_put(c, "manifest.json", json.dumps(manifest).encode(), "application/json")

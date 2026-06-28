@@ -4,7 +4,13 @@ on:
   schedule:
     # ~1 h after each HRDPS run publishes (runs 00/06/12/18Z land ~+3.5 h)
     - cron: "5 5,11,17,23 * * *"
-  workflow_dispatch: {}        # allows manual "Run workflow" for testing
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = decode + upload to R2 ; test = decode 3 h, no upload"
+        type: choice
+        options: [full, test]
+        default: full
 
 concurrency:
   group: hrdps-ingest
@@ -27,10 +33,22 @@ jobs:
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Run ingest
+      - name: Run ingest (full → R2)
+        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'full' }}
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
         run: python ingest.py
+
+      - name: Run ingest (test → decode only, no upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: python ingest.py --no-upload --max-hours 3 --regions haida-gwaii
+
+      - name: Upload test output
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hrdps-test-out
+          path: out/
