@@ -1,11 +1,16 @@
-name: HRDPS 2.5 km ingest
+name: HRDPS ingest
 
 on:
   schedule:
-    # ~1 h after each HRDPS run publishes (runs 00/06/12/18Z land ~+3.5 h)
-    - cron: "5 5,11,17,23 * * *"
+    - cron: "5 5,11,17,23 * * *"     # continental 2.5 km, 4x/day (~1h after 00/06/12/18Z)
+    - cron: "20 7,19 * * *"          # west 1 km nest, 2x/day (~7h after 00/12Z)
   workflow_dispatch:
     inputs:
+      model:
+        description: "continental (2.5 km) or hrdps_west (1 km)"
+        type: choice
+        options: [continental, hrdps_west]
+        default: continental
       mode:
         description: "full = decode + upload to R2 ; test = decode 3 h, no upload"
         type: choice
@@ -13,42 +18,48 @@ on:
         default: full
 
 concurrency:
-  group: hrdps-ingest
+  group: hrdps-ingest-${{ github.event.schedule || github.event.inputs.model }}
   cancel-in-progress: false
 
 jobs:
   ingest:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - name: Install eccodes (GRIB2 decoder)
         run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-dev
-
       - name: Install Python deps
         run: pip install -r requirements.txt
 
-      - name: Run ingest (full → R2)
-        if: ${{ github.event_name == 'schedule' || github.event.inputs.mode == 'full' }}
+      - name: Continental 2.5 km (full → R2)
+        if: ${{ github.event.schedule == '5 5,11,17,23 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full' && github.event.inputs.model == 'continental') }}
         env:
           R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python ingest.py
+        run: python ingest.py --model continental
 
-      - name: Run ingest (test → decode only, no upload)
+      - name: West 1 km (full → R2)
+        if: ${{ github.event.schedule == '20 7,19 * * *' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full' && github.event.inputs.model == 'hrdps_west') }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python ingest.py --model hrdps_west
+
+      - name: Test (decode only, no upload)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
-        run: python ingest.py --no-upload --max-hours 3 --regions haida-gwaii
+        run: python ingest.py --model ${{ github.event.inputs.model }} --no-upload --max-hours 3 --regions haida-gwaii
 
       - name: Upload test output
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
         uses: actions/upload-artifact@v4
         with:
-          name: hrdps-test-out
+          name: hrdps-test-${{ github.event.inputs.model }}
           path: out/

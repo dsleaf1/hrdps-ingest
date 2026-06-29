@@ -1,27 +1,45 @@
 #!/usr/bin/env python3
 """
-HRDPS 2.5 km wind ingest for the BC-coast kayaker map.
+HRDPS wind ingest for the BC-coast kayaker map.
 
-Pipeline:
-  1. Find the latest complete HRDPS Continental run on ECCC Datamart.
-  2. For each forecast hour, download 10 m WIND (speed) + WDIR (direction) GRIB2
-     (native rotated ~2.5 km grid, code RLatLon0.0225).
-  3. Regrid each kayak region to a regular lat/lon grid at ~0.0225 deg (~2.5 km),
-     nearest-neighbour from the rotated grid.
-  4. Byte-pack speed (km/h, 255 = nodata) + direction (0..360 -> 0..255) per hour.
-  5. gzip + upload per-region binaries and a manifest.json to Cloudflare R2.
+Two models (select with --model):
+  continental : HRDPS Continental 2.5 km, operational (dd.weather.gc.ca), 00/06/12/18Z, 0-48h
+  hrdps_west  : HRDPS West 1 km nest, experimental (dd.alpha.weather.gc.ca), 00/12Z only, 1-48h
+                footprint lat 45.9..60.3, lon -134.6..-109.5 (covers all 6 kayak regions)
 
-Runs on GitHub Actions 4x/day. Local smoke test (needs eccodes + deps):
-  python ingest.py --no-upload --regions haida-gwaii --max-hours 3
+Pipeline: find latest complete run -> download 10 m WIND (speed) + WDIR (direction) GRIB2
+(native rotated grid) -> nearest-neighbour regrid each region to a regular lat/lon grid at the
+model's native spacing -> byte-pack speed (km/h, 255=nodata) + direction (0..360->0..255) per
+hour -> gzip + upload per-region binaries + manifest.json to Cloudflare R2 under the model prefix.
+
+Local smoke test (needs eccodes + deps):
+  python ingest.py --model hrdps_west --no-upload --regions haida-gwaii --max-hours 3
 """
 import os, re, sys, gzip, json, time, argparse, tempfile
 import datetime as dt
 import urllib.request
 import numpy as np
 
-DATAMART = "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km"
-RES = 0.0225                         # target grid spacing (deg), ~2.5 km
-FCST_HOURS = list(range(0, 49))      # 000..048
+MODELS = {
+    "continental": {
+        "name": "HRDPS Continental 2.5 km (ECCC)",
+        "base": "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km",
+        "res": 0.0225, "hours": list(range(0, 49)),
+        "wind_label": "WIND_AGL-10m", "wdir_label": "WDIR_AGL-10m",
+        "fhour_re": r"PT\d{3}H", "fhour_fmt": "PT{:03d}H",
+        "prefix": "hrdps",
+    },
+    "hrdps_west": {
+        "name": "HRDPS West 1 km nest (ECCC, experimental)",
+        "base": "https://dd.alpha.weather.gc.ca/model_hrdps/west/1km/grib2",
+        "res": 0.009, "hours": list(range(1, 49)),     # west nest has no hour 000
+        "wind_label": "WIND_TGL_10", "wdir_label": "WDIR_TGL_10",
+        "fhour_re": r"P\d{3}-00", "fhour_fmt": "P{:03d}-00",
+        "prefix": "hrdps1km",
+    },
+}
+M = MODELS["continental"]      # set in main()
+RES = M["res"]
 
 # region key -> bbox [lonW, latS, lonE, latN]  (must match the map app's REGIONS)
 REGIONS = {
@@ -33,12 +51,9 @@ REGIONS = {
     "puget-sound":             [-123.3, 47.0, -122.2, 48.4],
 }
 REGION_NAMES = {
-    "haida-gwaii": "Haida Gwaii",
-    "west-coast-vancouver-i": "West Coast Vancouver I.",
-    "broughtons-discovery": "Broughtons & Discovery",
-    "northern-georgia-strait": "Northern Georgia Strait",
-    "san-juan-gulf-islands": "San Juan & Gulf Islands",
-    "puget-sound": "Puget Sound",
+    "haida-gwaii": "Haida Gwaii", "west-coast-vancouver-i": "West Coast Vancouver I.",
+    "broughtons-discovery": "Broughtons & Discovery", "northern-georgia-strait": "Northern Georgia Strait",
+    "san-juan-gulf-islands": "San Juan & Gulf Islands", "puget-sound": "Puget Sound",
 }
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
@@ -60,32 +75,29 @@ def list_links(url):
 
 def find_latest_run():
     """Return (run_hh, sample_wind_filename) for the newest run whose hour 048 exists."""
-    runs = sorted({l.strip("/") for l in list_links(DATAMART + "/") if re.fullmatch(r"\d{2}/", l)}, reverse=True)
+    runs = sorted({l.strip("/") for l in list_links(M["base"] + "/") if re.fullmatch(r"\d{2}/", l)}, reverse=True)
     for run in runs:
         try:
-            files = list_links(f"{DATAMART}/{run}/048/")
+            files = list_links(f"{M['base']}/{run}/048/")
         except Exception:
             continue
-        wind = [f for f in files if "_WIND_AGL-10m_" in f and f.endswith(".grib2")]
+        wind = [f for f in files if M["wind_label"] in f and f.endswith(".grib2")]
         if wind:
             return run, wind[0]
-    raise RuntimeError("No complete HRDPS run found on Datamart")
+    raise RuntimeError("No complete run found for model " + M["name"])
 
-def run_datetime(sample_filename, run_hh):
-    # filename like 20260628T12Z_MSC_HRDPS_WIND_AGL-10m_RLatLon0.0225_PT048H.grib2
-    m = re.match(r"(\d{8})T(\d{2})Z", sample_filename)
-    d = dt.datetime.strptime(m.group(1), "%Y%m%d").replace(
-        hour=int(m.group(2)), tzinfo=dt.timezone.utc)
-    return d
+def run_datetime(sample_filename):
+    # date+run token "YYYYMMDDTHHZ" appears at the start (continental) or mid-name (west)
+    m = re.search(r"(\d{8})T(\d{2})Z", sample_filename)
+    return dt.datetime.strptime(m.group(1), "%Y%m%d").replace(hour=int(m.group(2)), tzinfo=dt.timezone.utc)
 
-def hour_filename(sample, var, hhh):
-    f = re.sub(r"_(WIND|WDIR)_", f"_{var}_", sample)
-    f = re.sub(r"PT\d{3}H", f"PT{hhh:03d}H", f)
+def file_for(sample, label, hhh):
+    f = sample.replace(M["wind_label"], label)              # sample is the WIND file
+    f = re.sub(M["fhour_re"], M["fhour_fmt"].format(hhh), f)
     return f
 
 # ---------- GRIB decode ----------
 def read_grib(buf):
-    """Return (values2d, lat2d, lon2d[-180..180]) from a single-field GRIB2 message."""
     import xarray as xr
     with tempfile.NamedTemporaryFile(suffix=".grib2", delete=False) as tf:
         tf.write(buf); path = tf.name
@@ -106,29 +118,23 @@ def region_axes(bbox):
     W, S, E, N = bbox
     cols = int(round((E - W) / RES)) + 1
     rows = int(round((N - S) / RES)) + 1
-    lons = np.linspace(W, E, cols)
-    lats = np.linspace(N, S, rows)          # north -> south (row 0 = north)
-    return cols, rows, lons, lats
+    return cols, rows, np.linspace(W, E, cols), np.linspace(N, S, rows)   # row 0 = north
 
 def build_interp(lat, lon, bbox):
-    """KDTree over source points near the region (lon scaled by cos(midlat))."""
     from scipy.spatial import cKDTree
     W, S, E, N = bbox
-    midlat = (S + N) / 2.0
-    cosm = np.cos(np.radians(midlat))
+    cosm = np.cos(np.radians((S + N) / 2.0))
     m = (lon >= W - 0.2) & (lon <= E + 0.2) & (lat >= S - 0.2) & (lat <= N + 0.2)
     tree = cKDTree(np.column_stack([lon[m] * cosm, lat[m]]))
     cols, rows, lons, lats = region_axes(bbox)
     TLON, TLAT = np.meshgrid(lons * cosm, lats)
     dist, idx = tree.query(np.column_stack([TLON.ravel(), TLAT.ravel()]))
-    far = dist > RES * 1.6
-    return {"mask": m, "idx": idx, "far": far, "cols": cols, "rows": rows}
+    return {"mask": m, "idx": idx, "far": dist > RES * 1.6, "cols": cols, "rows": rows}
 
 def regrid(values2d, interp):
-    src = values2d[interp["mask"]].ravel()
-    out = src[interp["idx"]].astype("float32")
+    out = values2d[interp["mask"]].ravel()[interp["idx"]].astype("float32")
     out[interp["far"]] = np.nan
-    return out  # flat, length rows*cols, row 0 = north
+    return out
 
 def pack(speed_kmh, dir_deg):
     s = np.where(np.isnan(speed_kmh), 255, np.clip(np.round(speed_kmh), 0, 254)).astype("uint8")
@@ -138,46 +144,42 @@ def pack(speed_kmh, dir_deg):
 # ---------- R2 upload ----------
 def r2_client():
     import boto3
-    return boto3.client(
-        "s3",
-        endpoint_url=os.environ["R2_ENDPOINT"],
-        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"],
-    )
+    return boto3.client("s3", endpoint_url=os.environ["R2_ENDPOINT"],
+                        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"])
 
 def r2_put(client, key, data, content_type):
-    client.put_object(
-        Bucket=os.environ["R2_BUCKET"], Key="hrdps/" + key,
-        Body=gzip.compress(data), ContentType=content_type,
-        ContentEncoding="gzip", CacheControl="public, max-age=900",
-    )
+    client.put_object(Bucket=os.environ["R2_BUCKET"], Key=f"{M['prefix']}/{key}",
+                      Body=gzip.compress(data), ContentType=content_type,
+                      ContentEncoding="gzip", CacheControl="public, max-age=900")
 
 # ---------- main ----------
 def main():
+    global M, RES
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", choices=list(MODELS), default="continental")
     ap.add_argument("--no-upload", action="store_true", help="write to ./out instead of R2")
     ap.add_argument("--regions", default="", help="comma-separated region keys (default: all)")
     ap.add_argument("--max-hours", type=int, default=0, help="limit forecast hours (testing)")
     args = ap.parse_args()
+    M = MODELS[args.model]; RES = M["res"]
 
     keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS)
-    hours = FCST_HOURS[: args.max_hours] if args.max_hours else FCST_HOURS
+    hours = M["hours"][: args.max_hours] if args.max_hours else M["hours"]
 
     run_hh, sample = find_latest_run()
-    run_dt = run_datetime(sample, run_hh)
-    log(f"Latest run: {run_dt.isoformat()}  ({sample})")
+    run_dt = run_datetime(sample)
+    log(f"Model {args.model} ({M['res']} deg) | latest run {run_dt.isoformat()} | {sample}")
 
-    interps = {}                         # built once (grid geometry is constant)
+    interps = {}
     buffers = {k: bytearray() for k in keys}
     times = []
 
     for hhh in hours:
-        wname = hour_filename(sample, "WIND", hhh)
-        dname = hour_filename(sample, "WDIR", hhh)
-        base = f"{DATAMART}/{run_hh}/{hhh:03d}/"
+        base = f"{M['base']}/{run_hh}/{hhh:03d}/"
         try:
-            wbuf = http_get(base + wname, binary=True)
-            dbuf = http_get(base + dname, binary=True)
+            wbuf = http_get(base + file_for(sample, M["wind_label"], hhh), binary=True)
+            dbuf = http_get(base + file_for(sample, M["wdir_label"], hhh), binary=True)
         except Exception as e:
             log(f"  hour {hhh:03d}: missing ({e}); skipping"); continue
 
@@ -190,10 +192,7 @@ def main():
                 log(f"  region {k}: {interps[k]['cols']}x{interps[k]['rows']} cells")
 
         for k in keys:
-            spd = regrid(wvals * 3.6, interps[k])     # m/s -> km/h
-            drc = regrid(dvals, interps[k])
-            buffers[k] += pack(spd, drc)
-
+            buffers[k] += pack(regrid(wvals * 3.6, interps[k]), regrid(dvals, interps[k]))
         times.append((run_dt + dt.timedelta(hours=hhh)).strftime("%Y-%m-%dT%H:%M:%SZ"))
         log(f"  hour {hhh:03d}: ok")
 
@@ -201,36 +200,31 @@ def main():
         raise RuntimeError("No forecast hours ingested")
 
     manifest = {
-        "model": "HRDPS Continental 2.5 km (ECCC)",
-        "run": run_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "model": M["name"], "run": run_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "res_deg": RES, "nodata": 255, "hours": times,
-        "regions": {
-            k: {"name": REGION_NAMES[k], "bbox": REGIONS[k],
-                "cols": interps[k]["cols"], "rows": interps[k]["rows"],
-                "file": f"{k}.bin"} for k in keys
-        },
+        "regions": {k: {"name": REGION_NAMES[k], "bbox": REGIONS[k],
+                        "cols": interps[k]["cols"], "rows": interps[k]["rows"],
+                        "file": f"{k}.bin"} for k in keys},
     }
 
     if args.no_upload:
         os.makedirs("out", exist_ok=True)
         json.dump(manifest, open("out/manifest.json", "w"), indent=2)
         for k in keys: open(f"out/{k}.bin", "wb").write(bytes(buffers[k]))
-        log("Wrote ./out (manifest.json + region .bin files)")
-        # sanity stats on the last ingested hour, to confirm the decode is reasonable
+        log(f"Wrote ./out for model {args.model}")
         for k in keys:
             n = interps[k]["cols"] * interps[k]["rows"]
             spd = np.frombuffer(bytes(buffers[k][-2 * n:-n]), dtype="uint8").astype("float32")
             ok = spd[spd != 255]
             if ok.size:
-                log(f"  STATS {k}: {ok.size}/{n} valid cells | speed km/h min={ok.min():.0f} "
-                    f"mean={ok.mean():.0f} max={ok.max():.0f}")
+                log(f"  STATS {k}: {ok.size}/{n} valid | km/h min={ok.min():.0f} mean={ok.mean():.0f} max={ok.max():.0f}")
     else:
         c = r2_client()
         r2_put(c, "manifest.json", json.dumps(manifest).encode(), "application/json")
         for k in keys:
             r2_put(c, f"{k}.bin", bytes(buffers[k]), "application/octet-stream")
-        log(f"Uploaded manifest + {len(keys)} region files to R2 (hrdps/)")
+        log(f"Uploaded manifest + {len(keys)} region files to R2 ({M['prefix']}/)")
 
 if __name__ == "__main__":
     main()
