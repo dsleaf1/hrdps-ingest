@@ -23,7 +23,7 @@ import numpy as np
 MODELS = {
     "continental": {
         "name": "HRDPS Continental 2.5 km (ECCC)",
-        "base": "https://dd.weather.gc.ca/today/model_hrdps/continental/2.5km",
+        "base": "https://dd.weather.gc.ca/{date}/WXO-DD/model_hrdps/continental/2.5km",   # date-based layout (ECCC migration 2026-07)
         "res": 0.0225, "hours": list(range(0, 49)),
         "wind_label": "WIND_AGL-10m", "wdir_label": "WDIR_AGL-10m",
         "fhour_re": r"PT\d{3}H", "fhour_fmt": "PT{:03d}H",
@@ -73,17 +73,28 @@ def http_get(url, binary=False, retries=3):
 def list_links(url):
     return re.findall(r'href="([^"?][^"]*)"', http_get(url))
 
+def candidate_bases():
+    """Resolve M['base']; a {date} placeholder expands to today then yesterday (UTC)."""
+    if "{date}" not in M["base"]:
+        return [M["base"]]
+    now = dt.datetime.now(dt.timezone.utc)
+    return [M["base"].format(date=(now - dt.timedelta(days=d)).strftime("%Y%m%d")) for d in (0, 1)]
+
 def find_latest_run():
-    """Return (run_hh, sample_wind_filename) for the newest run whose hour 048 exists."""
-    runs = sorted({l.strip("/") for l in list_links(M["base"] + "/") if re.fullmatch(r"\d{2}/", l)}, reverse=True)
-    for run in runs:
+    """Return (base, run_hh, sample_wind_filename) for the newest run whose hour 048 exists."""
+    for b in candidate_bases():
         try:
-            files = list_links(f"{M['base']}/{run}/048/")
+            runs = sorted({l.strip("/") for l in list_links(b + "/") if re.fullmatch(r"\d{2}/", l)}, reverse=True)
         except Exception:
             continue
-        wind = [f for f in files if M["wind_label"] in f and f.endswith(".grib2")]
-        if wind:
-            return run, wind[0]
+        for run in runs:
+            try:
+                files = list_links(f"{b}/{run}/048/")
+            except Exception:
+                continue
+            wind = [f for f in files if M["wind_label"] in f and f.endswith(".grib2")]
+            if wind:
+                return b, run, wind[0]
     raise RuntimeError("No complete run found for model " + M["name"])
 
 def run_datetime(sample_filename):
@@ -167,7 +178,7 @@ def main():
     keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS)
     hours = M["hours"][: args.max_hours] if args.max_hours else M["hours"]
 
-    run_hh, sample = find_latest_run()
+    run_base, run_hh, sample = find_latest_run()
     run_dt = run_datetime(sample)
     log(f"Model {args.model} ({M['res']} deg) | latest run {run_dt.isoformat()} | {sample}")
 
@@ -176,7 +187,7 @@ def main():
     times = []
 
     for hhh in hours:
-        base = f"{M['base']}/{run_hh}/{hhh:03d}/"
+        base = f"{run_base}/{run_hh}/{hhh:03d}/"
         try:
             wbuf = http_get(base + file_for(sample, M["wind_label"], hhh), binary=True)
             dbuf = http_get(base + file_for(sample, M["wdir_label"], hhh), binary=True)
