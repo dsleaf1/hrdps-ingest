@@ -1,0 +1,38 @@
+name: SSCOFS currents
+
+on:
+  schedule:
+    - cron: "40 6,12,18,0 * * *"     # ~3h after SSCOFS t03/t09/t15/t21 cycles post
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = fetch + upload to R2 ; test = 3 h San Juan, no upload"
+        type: choice
+        options: [full, test]
+        default: full
+
+concurrency:
+  group: sscofs
+  cancel-in-progress: false
+
+jobs:
+  sscofs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - name: Extract SSCOFS virtual-station currents → R2
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full') }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python sscofs.py --hours 48
+      - name: Test (San Juan, 3 h, no upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: python sscofs.py --regions san-juan-gulf-islands --hours 3 --no-upload
