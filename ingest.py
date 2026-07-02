@@ -43,7 +43,7 @@ RES = M["res"]
 
 # region key -> bbox [lonW, latS, lonE, latN]  (must match the map app's REGIONS)
 REGIONS = {
-    "haida-gwaii":             [-132.8, 51.4, -130.6, 53.6],
+    "haida-gwaii":             [-133.6, 50.7, -128.3, 54.5],   # full Dixon–Hecate–QCS transect (2026-07-01)
     "west-coast-vancouver-i":  [-128.7, 48.3, -124.8, 50.9],
     "broughtons-discovery":    [-127.3, 49.9, -124.7, 50.95],
     "northern-georgia-strait": [-125.4, 49.0, -123.4, 50.2],
