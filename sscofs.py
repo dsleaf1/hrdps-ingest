@@ -105,8 +105,10 @@ def main():
     out={"model":"SSCOFS","run":run.strftime("%Y-%m-%dT%H:%M:%SZ"),
          "generated":dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
          "hours":[],"stations":[]}
-    hrs=list(range(a.hours+1))
-    out["hours"]=[int((run+dt.timedelta(hours=h)).timestamp()*1000) for h in hrs]
+    # prepend nowcast n001..n005 (= run-5h .. run-1h) so the series covers wind
+    # timelines that start before this cycle; then forecast f000..fNN
+    hrs=[("n",n,n-6) for n in range(1,6)] + [("f",h,h) for h in range(a.hours+1)]
+    out["hours"]=[int((run+dt.timedelta(hours=off)).timestamp()*1000) for _,_,off in hrs]
     regmeta={}
     for reg in keys:
         rs=[s for s in st if s[0]==reg]
@@ -119,12 +121,12 @@ def main():
     for reg in keys:
         (iy0,iy1,ix0,ix1),snapped=regmeta[reg]; ny,nx=iy1-iy0+1,ix1-ix0+1
         series={nm:[] for _,nm,_,_,_ in snapped}
-        for h in hrs:
-            url=f"{OPENDAP}/{day}/sscofs.{cyc}.{ymd}.regulargrid.f{h:03d}.nc.ascii?"+enc(
+        for hi,(kind,num,off) in enumerate(hrs):
+            url=f"{OPENDAP}/{day}/sscofs.{cyc}.{ymd}.regulargrid.{kind}{num:03d}.nc.ascii?"+enc(
                 f"u_eastward[0][0][{iy0}:{iy1}][{ix0}:{ix1}],v_northward[0][0][{iy0}:{iy1}][{ix0}:{ix1}]")
             txt=curl(url)
             U=parse2d(txt,"u_eastward"); V=parse2d(txt,"v_northward")
-            tms=out["hours"][h]
+            tms=out["hours"][hi]
             for reg2,nm,la,lo,cell in snapped:
                 if not cell: continue
                 u=U.get((cell[0]-iy0,cell[1]-ix0)); v=V.get((cell[0]-iy0,cell[1]-ix0))
