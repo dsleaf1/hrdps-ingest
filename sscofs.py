@@ -96,6 +96,35 @@ def snap_region(day,cyc,ymd,stns,pad=9):
         snapped.append((reg,nm,la,lo,best))
     return (iy0,iy1,ix0,ix1),snapped
 
+def archive_broughtons(stationlist, run, s3, bucket):
+    """Append the nowcast/analysis portion (valid<=run) of each Broughtons&Discovery
+    station to a monthly CSV in R2, deduped by (time,station). Consecutive 6-hourly
+    cycles tile into a continuous hourly record of predicted currents across the region."""
+    run_ms=run.timestamp()*1000
+    key=f"sscofs/archive/broughtons_{run.strftime('%Y%m')}.csv"
+    try: existing=s3.get_object(Bucket=bucket,Key=key)["Body"].read().decode()
+    except Exception: existing=""
+    seen=set()
+    for line in existing.splitlines()[1:]:
+        p=line.split(",")
+        if len(p)>=2: seen.add((p[0],p[1]))
+    new=[]
+    for s in stationlist:
+        if s["region"]!="broughtons-discovery": continue
+        for tms,u,v in s["ev"]:
+            if tms>run_ms+1: continue                     # nowcast + analysis only (valid <= run)
+            iso=dt.datetime.fromtimestamp(tms/1000,dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            if (iso,s["name"]) in seen: continue
+            seen.add((iso,s["name"]))
+            spd=math.hypot(u,v); drr=math.degrees(math.atan2(u,v))%360
+            new.append(f"{iso},{s['name']},{spd:.2f},{drr:.0f},{u},{v}")
+    if not new:
+        print("archive: no new rows",file=sys.stderr); return
+    body=(existing if existing else "time_utc,station,speed_kt,dir_deg,u_kt,v_kt\n").rstrip("\n")
+    body=body+"\n"+"\n".join(sorted(new))+"\n"
+    s3.put_object(Bucket=bucket,Key=key,Body=body.encode(),ContentType="text/csv",CacheControl="max-age=300")
+    print(f"archived {len(new)} rows -> {key} ({body.count(chr(10))-1} total)",file=sys.stderr)
+
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--hours",type=int,default=48)
     ap.add_argument("--regions",default=""); ap.add_argument("--no-upload",action="store_true")
@@ -148,12 +177,14 @@ def main():
     open("sscofs_stations.json","w").write(js)
     print(f"wrote sscofs_stations.json  {len(stationlist)} stations  {len(js)} bytes",file=sys.stderr)
     if not a.no_upload:
-        import boto3
+        import boto3, gzip
+        BUCKET=os.environ.get("R2_BUCKET","hrdps")
         s3=boto3.client("s3",endpoint_url=os.environ["R2_ENDPOINT"],
             aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"])
-        import gzip
-        s3.put_object(Bucket=os.environ.get("R2_BUCKET","hrdps"),Key="sscofs/stations.json",Body=gzip.compress(js.encode()),
+        s3.put_object(Bucket=BUCKET,Key="sscofs/stations.json",Body=gzip.compress(js.encode()),
             ContentType="application/json",ContentEncoding="gzip",CacheControl="max-age=600")
         print("uploaded sscofs/stations.json",file=sys.stderr)
+        try: archive_broughtons(stationlist, run, s3, BUCKET)      # long-term Broughtons record
+        except Exception as e: print("archive failed:",e,file=sys.stderr)
 
 if __name__=="__main__": main()
