@@ -55,6 +55,10 @@ STATIONS=[
  ("broughtons-discovery","Blackfish Sound",50.550,-126.600),
  ("broughtons-discovery","Broughton Strait",50.580,-126.920),
  ("broughtons-discovery","Weynton Passage",50.580,-126.750),
+ # Broughtons — user-requested points (2026-07-03; names provisional, in-SSCOFS-domain verified)
+ ("broughtons-discovery","Retreat Passage",50.651028,-126.760238),
+ ("broughtons-discovery","Sutlej Channel",50.807757,-126.520566),
+ ("broughtons-discovery","Mackenzie Sound",50.939046,-126.480698),
  # Northern Georgia Strait
  ("northern-georgia-strait","Georgia Strait central",49.600,-124.600),
  ("northern-georgia-strait","Georgia Strait N",49.880,-124.880),
