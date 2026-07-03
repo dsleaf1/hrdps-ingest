@@ -47,7 +47,7 @@ REGIONS = {
     "west-coast-vancouver-i":  [-128.7, 48.3, -124.8, 50.9],
     "broughtons-discovery":    [-127.3, 49.9, -124.7, 50.95],
     "northern-georgia-strait": [-125.4, 49.0, -123.4, 50.2],
-    "san-juan-gulf-islands":   [-123.7, 48.3, -122.5, 49.3],
+    "san-juan-gulf-islands":   [-123.95, 48.3, -122.5, 49.3],   # widened W for Dodd Narrows/Gabriola (2026-07-03)
     "puget-sound":             [-123.3, 47.0, -122.2, 48.4],
 }
 REGION_NAMES = {
