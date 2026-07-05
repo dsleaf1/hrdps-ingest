@@ -34,6 +34,25 @@ PRESETS = [
     ("san-juan-gulf-islands",  "Haro Strait",       48.55,   -123.17),
 ]
 
+# Haida Gwaii barotropic current-model axis points + Masset (the map's Haida
+# "current stations"). Adding them here so the map can attach pre-baked waves
+# to those stations by proximity → wind-against-current hazard rings work in
+# Dixon/Hecate/QCS offline, not just live. Coords mirror HAIDA_TIDES in
+# hrdps_map.html; names carry an index since axis points share an axis name.
+HAIDA_CURRENT_POINTS = [
+    ("Dixon Entrance", [(54.3,-132.6),(54.33,-131.7),(54.28,-130.9)]),
+    ("Hecate Strait", [(53.55,-131.3),(53.0,-131.05),(52.35,-131.0),(51.78,-131.05),(51.6,-130.95)]),
+    ("Queen Charlotte Sound", [(51.6,-129.7),(51.25,-129.0),(50.95,-128.5)]),
+    ("North Graham coast", [(54.18,-132.3),(54.2,-131.7)]),
+    ("West Graham coast", [(54.0,-133.25),(53.6,-133.15),(53.25,-132.95)]),
+    ("West Moresby & Kunghit", [(52.7,-132.25),(52.4,-131.85),(52.15,-131.5)]),
+    ("Masset Channel", [(54.0029,-132.1543)]),
+]
+for _axis, _pts in HAIDA_CURRENT_POINTS:
+    for _i, (_la, _lo) in enumerate(_pts):
+        _nm = _axis if len(_pts) == 1 else f"{_axis} {_i+1}"
+        PRESETS.append(("haida-gwaii", _nm, _la, _lo))
+
 OM_URL = ("https://marine-api.open-meteo.com/v1/marine"
           "?latitude={lats}&longitude={lons}"
           "&hourly=wave_height,wave_period,wave_direction"
