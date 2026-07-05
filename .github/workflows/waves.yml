@@ -1,0 +1,28 @@
+name: Wave forecast pre-bake
+
+on:
+  schedule:
+    - cron: "50 */3 * * *"          # 8x/day; a few seconds of runtime, feeds the map's offline waves
+  workflow_dispatch:
+
+concurrency:
+  group: waves
+  cancel-in-progress: false
+
+jobs:
+  waves:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - name: Open-Meteo Marine spots → R2 waves/latest.json
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python waves.py
