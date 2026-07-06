@@ -27,9 +27,18 @@ LAND = [
     ("csj", "Cape St. James CS", (-131.2, 51.8, -130.8, 52.1)),
 ]
 
+# ECCC (dd/api.weather.gc.ca) has transient outages. A single miss is harmless —
+# the browser keeps serving the last good obs/latest.json and greys stale rows.
+# So tolerate up to MAX_FAILS-1 consecutive empty runs (exit 0, no failure email);
+# only fail the job — and alert — on the MAX_FAILS-th in a row. The counter lives
+# in R2 (Cloudflare, independent of ECCC, so writable even during an ECCC outage).
+MAX_FAILS = 3
+HEALTH_KEY = "obs/health.json"
+
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
-def curl(url, timeout=60):
+def curl(url, timeout=40):
+    # 40s × (1 + 2 retries) × 3 endpoints ≈ 360s worst case, safely under the 10-min job wall
     r = subprocess.run(["curl", "-gsS", "-m", str(timeout), "--retry", "2", url],
                        capture_output=True)
     if r.returncode != 0:
@@ -117,32 +126,66 @@ def land_stations(now):
         log(f"land {sid}: {out[-1]['wspd_kt']} kt @ {out[-1]['time']}")
     return out
 
+def r2_client():
+    import boto3
+    return boto3.client("s3", endpoint_url=os.environ["R2_ENDPOINT"],
+                        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
+                        aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"])
+
+def get_health(s3, bucket):
+    try:
+        return json.loads(s3.get_object(Bucket=bucket, Key=HEALTH_KEY)["Body"].read())
+    except Exception:
+        return {}
+
+def put_health(s3, bucket, h):
+    # stored uncompressed (tiny, server-side only) so it reads back without gunzip
+    s3.put_object(Bucket=bucket, Key=HEALTH_KEY, Body=json.dumps(h).encode(),
+                  ContentType="application/json", CacheControl="no-store")
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-upload", action="store_true")
     a = ap.parse_args()
 
     now = dt.datetime.now(dt.timezone.utc)
+    now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
     dates = [now.strftime("%Y%m%d"), (now - dt.timedelta(days=1)).strftime("%Y%m%d")]
     stations = buoy_stations(dates) + land_stations(now)
-    if not stations:
-        raise RuntimeError("no observations collected")
-    doc = {"generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "stations": stations}
-    body = json.dumps(doc).encode()
-    log(f"{len(stations)} stations, {len(body)} bytes")
 
     if a.no_upload:
+        if not stations:
+            raise RuntimeError("no observations collected")
+        doc = {"generated": now_iso, "stations": stations}
         json.dump(doc, open("obs_latest.json", "w"), indent=1)
-        log("wrote ./obs_latest.json")
+        log(f"{len(stations)} stations; wrote ./obs_latest.json")
         return
-    import boto3
-    s3 = boto3.client("s3", endpoint_url=os.environ["R2_ENDPOINT"],
-                      aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],
-                      aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"])
-    s3.put_object(Bucket=os.environ["R2_BUCKET"], Key="obs/latest.json",
+
+    s3 = r2_client()
+    bucket = os.environ["R2_BUCKET"]
+
+    if not stations:
+        # ECCC unreachable this run — record the miss, tolerate the first MAX_FAILS-1
+        h = get_health(s3, bucket)
+        n = int(h.get("consecutive_failures", 0)) + 1
+        put_health(s3, bucket, {"consecutive_failures": n,
+                                "last_failure": now_iso,
+                                "last_success": h.get("last_success")})
+        if n >= MAX_FAILS:
+            raise RuntimeError(f"no observations collected — {n} consecutive failures "
+                               f"(ECCC likely down for hours); alerting")
+        log(f"WARN: no observations collected (consecutive failure {n}/{MAX_FAILS}); "
+            f"keeping last good obs/latest.json, exiting 0 (no alert)")
+        return
+
+    doc = {"generated": now_iso, "stations": stations}
+    body = json.dumps(doc).encode()
+    log(f"{len(stations)} stations, {len(body)} bytes")
+    s3.put_object(Bucket=bucket, Key="obs/latest.json",
                   Body=gzip.compress(body), ContentType="application/json",
                   ContentEncoding="gzip", CacheControl="public, max-age=300")
     log("uploaded obs/latest.json")
+    put_health(s3, bucket, {"consecutive_failures": 0, "last_success": now_iso})
 
 if __name__ == "__main__":
     main()
