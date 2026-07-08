@@ -1,0 +1,41 @@
+name: SSCOFS current field
+
+on:
+  schedule:
+    - cron: "50 6,12,18,0 * * *"     # ~3h after SSCOFS t03/t09/t15/t21 cycles post (after the station job)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = fetch + upload field tiles to R2 ; test = 2 h San Juan, no upload"
+        type: choice
+        options: [full, test]
+        default: full
+      regions:
+        description: "comma-separated region keys (blank = validated core: puget, san-juan, N-georgia)"
+        default: ""
+
+concurrency:
+  group: sscofs-field
+  cancel-in-progress: false
+
+jobs:
+  field:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+      - name: Build SSCOFS current-field tiles → R2
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full') }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python sscofs.py --field --hours 48 --regions "${{ github.event.inputs.regions }}"
+      - name: Test (San Juan field, 2 h, no upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: python sscofs.py --field --regions san-juan-gulf-islands --hours 2 --no-upload

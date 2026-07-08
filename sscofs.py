@@ -68,6 +68,82 @@ STATIONS=[
  ("northern-georgia-strait","Georgia Strait S-central",49.320,-124.180),
 ]
 
+# Field tiles: full-region SSCOFS surface-current windows byte-packed like the wind field.
+# bbox [W,S,E,N] matches the wind map REGIONS so the current map aligns. Validated core first.
+FIELD_REGIONS={
+ "puget-sound":            [-123.3, 47.0, -122.2, 48.4],
+ "san-juan-gulf-islands":  [-123.95, 48.3, -122.5, 49.3],
+ "northern-georgia-strait":[-125.4, 49.0, -123.4, 50.2],
+}
+
+def pack_field(day,cyc,ymd,bbox,hrs,tmo=180):
+    """Fetch the SSCOFS surface u,v window for a region bbox each hour and byte-pack it
+    like the wind field: per hour = rows*cols speed bytes (kt*10, 255=nodata) then rows*cols
+    dir bytes (toward-bearing * 255/360). Row 0 = NORTH, col 0 = WEST. Returns
+    (cols, rows, center_bbox[W,S,E,N], bytearray)."""
+    W,S,E,N=bbox
+    iy0=round((S-LAT0)/DX); iy1=round((N-LAT0)/DX)      # iy grows north
+    ix0=round((W-LON0)/DX); ix1=round((E-LON0)/DX)      # ix grows east
+    cols,rows=ix1-ix0+1,iy1-iy0+1
+    cbbox=[round(LON0+ix0*DX,4),round(LAT0+iy0*DX,4),round(LON0+ix1*DX,4),round(LAT0+iy1*DX,4)]
+    buf=bytearray()
+    for kind,num,off in hrs:
+        url=f"{OPENDAP}/{day}/sscofs.{cyc}.{ymd}.regulargrid.{kind}{num:03d}.nc.ascii?"+enc(
+            f"u_eastward[0][0][{iy0}:{iy1}][{ix0}:{ix1}],v_northward[0][0][{iy0}:{iy1}][{ix0}:{ix1}]")
+        txt=curl(url,tmo)
+        U=parse2d(txt,"u_eastward"); V=parse2d(txt,"v_northward")
+        spd=bytearray(rows*cols); drr=bytearray(rows*cols); k=0; nwater=0
+        for orow in range(rows):            # north-first output
+            r=rows-1-orow                   # grid row (0=south)
+            for c in range(cols):
+                u=U.get((r,c)); v=V.get((r,c))
+                if u is None or v is None or abs(u)>100 or abs(v)>100:
+                    spd[k]=255; drr[k]=0
+                else:
+                    b=round(math.hypot(u,v)*KT*10)      # kt*10
+                    spd[k]=min(b,254)
+                    drr[k]=round((math.degrees(math.atan2(u,v))%360)*255/360)%256
+                    nwater+=1
+                k+=1
+        buf+=spd+drr
+        print(f"    {kind}{num:03d}: {nwater}/{rows*cols} water",file=sys.stderr)
+    return cols,rows,cbbox,buf
+
+def field_main(a):
+    import gzip
+    day,cyc,ymd=latest_cycle()
+    run=dt.datetime.strptime(ymd+cyc,"%Y%m%dt%Hz").replace(tzinfo=dt.timezone.utc)
+    print(f"FIELD cycle {day} {cyc} run={run.isoformat()}",file=sys.stderr)
+    keys=[k for k in a.regions.split(",") if k] or list(FIELD_REGIONS)
+    hrs=[("f",h,h) for h in range(a.hours+1)]                       # f000..fNN
+    hours_ms=[int((run+dt.timedelta(hours=off)).timestamp()*1000) for _,_,off in hrs]
+    manifest={"model":"SSCOFS surface current","run":run.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "generated":dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "res_deg":DX,"nodata":255,"speed_unit":"kt_x10","dir_convention":"toward",
+              "hours":hours_ms,"regions":{}}
+    blobs={}
+    for reg in keys:
+        cols,rows,cbbox,buf=pack_field(day,cyc,ymd,FIELD_REGIONS[reg],hrs)
+        manifest["regions"][reg]={"name":reg,"bbox":cbbox,"cols":cols,"rows":rows,"file":f"{reg}.bin"}
+        blobs[reg]=bytes(buf)
+        print(f"  {reg}: {cols}x{rows} x{len(hrs)}h -> {len(buf)} bytes",file=sys.stderr)
+    if a.no_upload:
+        os.makedirs("field_out",exist_ok=True)
+        json.dump(manifest,open("field_out/manifest.json","w"),indent=1)
+        for reg,b in blobs.items(): open(f"field_out/{reg}.bin","wb").write(b)
+        print("wrote ./field_out",file=sys.stderr); return
+    import boto3
+    BUCKET=os.environ.get("R2_BUCKET","hrdps")
+    s3=boto3.client("s3",endpoint_url=os.environ["R2_ENDPOINT"],
+        aws_access_key_id=os.environ["R2_ACCESS_KEY_ID"],aws_secret_access_key=os.environ["R2_SECRET_ACCESS_KEY"])
+    s3.put_object(Bucket=BUCKET,Key="sscofs/field/manifest.json",
+        Body=gzip.compress(json.dumps(manifest,separators=(",",":")).encode()),
+        ContentType="application/json",ContentEncoding="gzip",CacheControl="max-age=600")
+    for reg,b in blobs.items():
+        s3.put_object(Bucket=BUCKET,Key=f"sscofs/field/{reg}.bin",Body=gzip.compress(b),
+            ContentType="application/octet-stream",ContentEncoding="gzip",CacheControl="max-age=900")
+    print(f"uploaded sscofs/field/manifest.json + {len(blobs)} region tiles",file=sys.stderr)
+
 def latest_cycle():
     for back in range(2):
         d=(dt.datetime.now(dt.timezone.utc)-dt.timedelta(days=back)).strftime("%Y/%m/%d")
@@ -128,7 +204,9 @@ def archive_broughtons(stationlist, run, s3, bucket):
 def main():
     ap=argparse.ArgumentParser(); ap.add_argument("--hours",type=int,default=48)
     ap.add_argument("--regions",default=""); ap.add_argument("--no-upload",action="store_true")
+    ap.add_argument("--field",action="store_true",help="build current-FIELD tiles (not point stations)")
     a=ap.parse_args()
+    if a.field: return field_main(a)
     day,cyc,ymd=latest_cycle()
     run=dt.datetime.strptime(ymd+cyc,"%Y%m%dt%Hz").replace(tzinfo=dt.timezone.utc)
     print(f"cycle {day} {cyc} run={run.isoformat()}",file=sys.stderr)
