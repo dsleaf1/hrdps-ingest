@@ -1,0 +1,41 @@
+name: SSCOFS mesh currents (native, high-res)
+
+on:
+  schedule:
+    - cron: "0 7,13,19,1 * * *"      # ~4h after SSCOFS t03/t09/t15/t21 cycles (after grid jobs)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = fetch + upload native-mesh currents to R2 ; test = 2 h Puget, no upload"
+        type: choice
+        options: [full, test]
+        default: full
+      regions:
+        description: "comma-separated region keys (blank = core: puget, san-juan, N-georgia)"
+        default: ""
+
+concurrency:
+  group: sscofs-mesh
+  cancel-in-progress: false
+
+jobs:
+  mesh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3 numpy
+      - name: Build SSCOFS native-mesh currents → R2
+        if: ${{ github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'full') }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python sscofs_mesh.py --hours 48 --regions "${{ github.event.inputs.regions }}"
+      - name: Test (Puget mesh, 2 h, no upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: python sscofs_mesh.py --regions puget-sound --hours 2 --no-upload
