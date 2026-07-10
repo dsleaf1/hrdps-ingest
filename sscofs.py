@@ -75,21 +75,28 @@ FIELD_REGIONS={
  "san-juan-gulf-islands":  [-123.95, 48.3, -122.5, 49.3],
  "northern-georgia-strait":[-125.4, 49.0, -123.4, 50.2],
 }
+# Whole-extent zoomed-out layer for the NANOOS-style big map (SSCOFS_Big_Map_Plan.md step 2):
+# Puget Sound -> QCS/model top, decimated by OVERVIEW_STRIDE (server-side DAP stride) to ~2 km.
+OVERVIEW_BBOX=[-129.0, 46.9, -122.0, 52.13]
+OVERVIEW_STRIDE=4
 
-def pack_field(day,cyc,ymd,bbox,hrs,tmo=180):
+def pack_field(day,cyc,ymd,bbox,hrs,tmo=180,stride=1):
     """Fetch the SSCOFS surface u,v window for a region bbox each hour and byte-pack it
     like the wind field: per hour = rows*cols speed bytes (kt*10, 255=nodata) then rows*cols
-    dir bytes (toward-bearing * 255/360). Row 0 = NORTH, col 0 = WEST. Returns
-    (cols, rows, center_bbox[W,S,E,N], bytearray)."""
+    dir bytes (toward-bearing * 255/360). Row 0 = NORTH, col 0 = WEST. stride>1 decimates
+    server-side (DAP [lo:stride:hi]; THREDDS prints dense row indices so parse2d is unchanged);
+    cell spacing becomes DX*stride. Returns (cols, rows, center_bbox[W,S,E,N], bytearray)."""
     W,S,E,N=bbox
     iy0=round((S-LAT0)/DX); iy1=round((N-LAT0)/DX)      # iy grows north
     ix0=round((W-LON0)/DX); ix1=round((E-LON0)/DX)      # ix grows east
-    cols,rows=ix1-ix0+1,iy1-iy0+1
+    iy0=iy1-((iy1-iy0)//stride)*stride                   # snap so the N/E edges are kept
+    ix1=ix0+((ix1-ix0)//stride)*stride
+    cols,rows=(ix1-ix0)//stride+1,(iy1-iy0)//stride+1
     cbbox=[round(LON0+ix0*DX,4),round(LAT0+iy0*DX,4),round(LON0+ix1*DX,4),round(LAT0+iy1*DX,4)]
     buf=bytearray()
     for kind,num,off in hrs:
         url=f"{OPENDAP}/{day}/sscofs.{cyc}.{ymd}.regulargrid.{kind}{num:03d}.nc.ascii?"+enc(
-            f"u_eastward[0][0][{iy0}:{iy1}][{ix0}:{ix1}],v_northward[0][0][{iy0}:{iy1}][{ix0}:{ix1}]")
+            f"u_eastward[0][0][{iy0}:{stride}:{iy1}][{ix0}:{stride}:{ix1}],v_northward[0][0][{iy0}:{stride}:{iy1}][{ix0}:{stride}:{ix1}]")
         txt=curl(url,tmo)
         U=parse2d(txt,"u_eastward"); V=parse2d(txt,"v_northward")
         spd=bytearray(rows*cols); drr=bytearray(rows*cols); k=0; nwater=0
@@ -114,7 +121,7 @@ def field_main(a):
     day,cyc,ymd=latest_cycle()
     run=dt.datetime.strptime(ymd+cyc,"%Y%m%dt%Hz").replace(tzinfo=dt.timezone.utc)
     print(f"FIELD cycle {day} {cyc} run={run.isoformat()}",file=sys.stderr)
-    keys=[k for k in a.regions.split(",") if k] or list(FIELD_REGIONS)
+    keys=[k for k in a.regions.split(",") if k] or list(FIELD_REGIONS)+["overview"]
     hrs=[("f",h,h) for h in range(a.hours+1)]                       # f000..fNN
     hours_ms=[int((run+dt.timedelta(hours=off)).timestamp()*1000) for _,_,off in hrs]
     manifest={"model":"SSCOFS surface current","run":run.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -123,8 +130,11 @@ def field_main(a):
               "hours":hours_ms,"regions":{}}
     blobs={}
     for reg in keys:
-        cols,rows,cbbox,buf=pack_field(day,cyc,ymd,FIELD_REGIONS[reg],hrs)
-        manifest["regions"][reg]={"name":reg,"bbox":cbbox,"cols":cols,"rows":rows,"file":f"{reg}.bin"}
+        stride=OVERVIEW_STRIDE if reg=="overview" else 1
+        bbox=OVERVIEW_BBOX if reg=="overview" else FIELD_REGIONS[reg]
+        cols,rows,cbbox,buf=pack_field(day,cyc,ymd,bbox,hrs,stride=stride)
+        manifest["regions"][reg]={"name":reg,"bbox":cbbox,"cols":cols,"rows":rows,
+                                  "res_deg":DX*stride,"file":f"{reg}.bin"}
         blobs[reg]=bytes(buf)
         print(f"  {reg}: {cols}x{rows} x{len(hrs)}h -> {len(buf)} bytes",file=sys.stderr)
     if a.no_upload:
