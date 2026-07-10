@@ -12,8 +12,12 @@ Pipeline: find latest complete run -> download 10 m WIND (speed) + WDIR (directi
 model's native spacing -> byte-pack speed (km/h, 255=nodata) + direction (0..360->0..255) per
 hour -> gzip + upload per-region binaries + manifest.json to Cloudflare R2 under the model prefix.
 
+Alongside the six map regions (which do not tile the coast) there is an "overview" region
+covering the whole unified-map extent at ~2.5 km; see OVERVIEW_BBOX.
+
 Local smoke test (needs eccodes + deps):
   python ingest.py --model hrdps_west --no-upload --regions haida-gwaii --max-hours 3
+  python ingest.py --no-upload --regions overview --max-hours 2
 """
 import os, re, sys, gzip, json, time, argparse, tempfile
 import datetime as dt
@@ -54,7 +58,23 @@ REGION_NAMES = {
     "haida-gwaii": "Haida Gwaii", "west-coast-vancouver-i": "West Coast Vancouver I.",
     "broughtons-discovery": "Broughtons & Discovery", "northern-georgia-strait": "Northern Georgia Strait",
     "san-juan-gulf-islands": "San Juan & Gulf Islands", "puget-sound": "Puget Sound",
+    "overview": "Whole extent (overview)",
 }
+
+# Whole-extent zoomed-out layer for the unified marine map (Unified_Marine_Map_Plan.md step 1).
+# The six regions above do NOT tile this extent: central Juan de Fuca (lon -124.8..-123.95 below
+# lat 48.3) and NE Queen Charlotte Sound (Cape Caution -> Rivers Inlet) fall in no region. Matches
+# sscofs.py's OVERVIEW_BBOX so the current and wind overviews share an extent.
+OVERVIEW_BBOX = [-129.0, 46.9, -122.0, 52.13]
+OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
+
+def overview_res():
+    """Overview cell size: never finer than OVERVIEW_RES, so the 1 km nest is downsampled here
+    (at native 1 km this extent would be ~43 MB/run) while the 2.5 km model passes through."""
+    return max(RES, OVERVIEW_RES)
+
+def bbox_of(key):  return OVERVIEW_BBOX if key == "overview" else REGIONS[key]
+def res_of(key):   return overview_res() if key == "overview" else RES
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
@@ -125,21 +145,23 @@ def read_grib(buf):
         except OSError: pass
 
 # ---------- regridding ----------
-def region_axes(bbox):
+def region_axes(bbox, res):
     W, S, E, N = bbox
-    cols = int(round((E - W) / RES)) + 1
-    rows = int(round((N - S) / RES)) + 1
+    cols = int(round((E - W) / res)) + 1
+    rows = int(round((N - S) / res)) + 1
     return cols, rows, np.linspace(W, E, cols), np.linspace(N, S, rows)   # row 0 = north
 
-def build_interp(lat, lon, bbox):
+def build_interp(lat, lon, bbox, res):
     from scipy.spatial import cKDTree
     W, S, E, N = bbox
     cosm = np.cos(np.radians((S + N) / 2.0))
     m = (lon >= W - 0.2) & (lon <= E + 0.2) & (lat >= S - 0.2) & (lat <= N + 0.2)
     tree = cKDTree(np.column_stack([lon[m] * cosm, lat[m]]))
-    cols, rows, lons, lats = region_axes(bbox)
+    cols, rows, lons, lats = region_axes(bbox, res)
     TLON, TLAT = np.meshgrid(lons * cosm, lats)
     dist, idx = tree.query(np.column_stack([TLON.ravel(), TLAT.ravel()]))
+    # "far" rejects target cells outside the model footprint, so it keys off the SOURCE spacing
+    # (RES), not the target's -- a decimated overview cell still has a source point ~RES away.
     return {"mask": m, "idx": idx, "far": dist > RES * 1.6, "cols": cols, "rows": rows}
 
 def regrid(values2d, interp):
@@ -175,7 +197,10 @@ def main():
     args = ap.parse_args()
     M = MODELS[args.model]; RES = M["res"]
 
-    keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS)
+    keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS) + ["overview"]
+    bad = [k for k in keys if k != "overview" and k not in REGIONS]
+    if bad:
+        raise SystemExit("unknown region(s): " + ", ".join(bad))
     hours = M["hours"][: args.max_hours] if args.max_hours else M["hours"]
 
     run_base, run_hh, sample = find_latest_run()
@@ -199,8 +224,8 @@ def main():
 
         if not interps:
             for k in keys:
-                interps[k] = build_interp(wlat, wlon, REGIONS[k])
-                log(f"  region {k}: {interps[k]['cols']}x{interps[k]['rows']} cells")
+                interps[k] = build_interp(wlat, wlon, bbox_of(k), res_of(k))
+                log(f"  region {k}: {interps[k]['cols']}x{interps[k]['rows']} cells @ {res_of(k)} deg")
 
         for k in keys:
             buffers[k] += pack(regrid(wvals * 3.6, interps[k]), regrid(dvals, interps[k]))
@@ -210,13 +235,16 @@ def main():
     if not times:
         raise RuntimeError("No forecast hours ingested")
 
+    # "overview" MUST come last: hrdps_summary.html picks the first region whose bbox contains the
+    # point, and the overview bbox contains them all -- ahead of them it would shadow every region.
+    mkeys = [k for k in keys if k != "overview"] + [k for k in keys if k == "overview"]
     manifest = {
         "model": M["name"], "run": run_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "res_deg": RES, "nodata": 255, "hours": times,
-        "regions": {k: {"name": REGION_NAMES[k], "bbox": REGIONS[k],
+        "regions": {k: {"name": REGION_NAMES[k], "bbox": bbox_of(k),
                         "cols": interps[k]["cols"], "rows": interps[k]["rows"],
-                        "file": f"{k}.bin"} for k in keys},
+                        "res_deg": res_of(k), "file": f"{k}.bin"} for k in mkeys},
     }
 
     if args.no_upload:
@@ -226,8 +254,10 @@ def main():
         log(f"Wrote ./out for model {args.model}")
         for k in keys:
             n = interps[k]["cols"] * interps[k]["rows"]
+            raw, gz = len(buffers[k]), len(gzip.compress(bytes(buffers[k])))
             spd = np.frombuffer(bytes(buffers[k][-2 * n:-n]), dtype="uint8").astype("float32")
             ok = spd[spd != 255]
+            log(f"  SIZE  {k}: {raw/1e6:.2f} MB raw -> {gz/1e6:.2f} MB gzipped ({len(times)} h)")
             if ok.size:
                 log(f"  STATS {k}: {ok.size}/{n} valid | km/h min={ok.min():.0f} mean={ok.mean():.0f} max={ok.max():.0f}")
     else:
