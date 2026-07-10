@@ -24,9 +24,13 @@ S3="https://noaa-nos-ofs-pds.s3.amazonaws.com"
 KT=1.94384
 
 REGIONS={
+ # bboxes overlap neighbours by >=0.05 deg so lazily-loaded tiles have no seam
  "puget-sound":            [-123.3, 47.0, -122.2, 48.4],
  "san-juan-gulf-islands":  [-123.95, 48.3, -122.5, 49.3],
  "northern-georgia-strait":[-125.4, 49.0, -123.4, 50.2],
+ "juan-de-fuca":           [-125.3, 48.0, -123.90, 48.75],   # Cape Flattery -> overlaps san-juan W edge
+ "broughtons-discovery":   [-127.6, 50.15, -124.9, 51.2],    # Discovery Is + Johnstone + Broughton/QCStrait
+ "johnstone-qcs-south":    [-129.0, 50.7, -126.3, 52.13],    # Cape Scott/Goletas -> QCS to model top (52.13N)
 }
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
