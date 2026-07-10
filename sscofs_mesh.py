@@ -28,8 +28,8 @@ REGIONS={
  "puget-sound":            [-123.3, 47.0, -122.2, 48.4],
  "san-juan-gulf-islands":  [-123.95, 48.3, -122.5, 49.3],
  "northern-georgia-strait":[-125.4, 49.0, -123.4, 50.2],
- "juan-de-fuca":           [-125.3, 48.0, -123.90, 48.75],   # Cape Flattery -> overlaps san-juan W edge
- "broughtons-discovery":   [-127.6, 50.15, -124.9, 51.2],    # Discovery Is + Johnstone + Broughton/QCStrait
+ "juan-de-fuca":           [-125.3, 48.0, -123.25, 48.75],   # Cape Flattery -> overlaps puget W edge (PA gap fix)
+ "broughtons-discovery":   [-127.6, 50.15, -124.3, 51.2],    # Discovery Is + Johnstone + Broughton + Bute/Toba
  "johnstone-qcs-south":    [-129.0, 50.7, -126.3, 52.13],    # Cape Scott/Goletas -> QCS to model top (52.13N)
 }
 
@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--hours",type=int,default=48)
     ap.add_argument("--regions",default="")
     ap.add_argument("--no-upload",action="store_true")
+    ap.add_argument("--force-geom",action="store_true",dest="force_geom",
+                    help="re-upload static mesh geometry even if present (use after a bbox change)")
     a=ap.parse_args()
     keys=[k for k in a.regions.split(",") if k] or list(REGIONS)
 
@@ -114,7 +116,7 @@ def main():
         if a.no_upload:
             os.makedirs("mesh_out",exist_ok=True); open(f"mesh_out/{key}.json","wb").write(js)
             log(f"  {key} mesh: {len(nodes)} nodes {len(tris)} tris {len(js)} bytes (local)")
-        elif not exists(mkey):
+        elif a.force_geom or not exists(mkey):
             put(mkey,js,"application/json"); log(f"  uploaded {mkey} ({len(js)} B)")
         else:
             log(f"  {mkey} exists, skip")

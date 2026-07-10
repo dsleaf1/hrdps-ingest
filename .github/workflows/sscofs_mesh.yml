@@ -11,8 +11,12 @@ on:
         options: [full, test]
         default: full
       regions:
-        description: "comma-separated region keys (blank = core: puget, san-juan, N-georgia)"
+        description: "comma-separated region keys (blank = all)"
         default: ""
+      force_geom:
+        description: "re-upload static mesh geometry even if present (after a bbox change)"
+        type: boolean
+        default: false
 
 concurrency:
   group: sscofs-mesh
@@ -35,7 +39,7 @@ jobs:
           R2_BUCKET: ${{ secrets.R2_BUCKET }}
           R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
-        run: python sscofs_mesh.py --hours 48 --regions "${{ github.event.inputs.regions }}"
+        run: python sscofs_mesh.py --hours 48 --regions "${{ github.event.inputs.regions }}" ${{ github.event.inputs.force_geom == 'true' && '--force-geom' || '' }}
       - name: Test (Puget mesh, 2 h, no upload)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
         run: python sscofs_mesh.py --regions puget-sound --hours 2 --no-upload
