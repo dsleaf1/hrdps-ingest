@@ -26,6 +26,17 @@ The map app reads `hrdps/manifest.json` then `hrdps/{region}.bin` from the R2 pu
 direction bytes (row 0 = north). Hour offset = `h * 2 * rows * cols`.
 Decode: `kmh = speed_byte` (255 ⇒ no data); `deg = dir_byte * 360 / 255`.
 
+## Season archive (Model Replay step 1, live 2026-07-17)
+
+Alongside the latest-overwrite flow, each job retains the day's data under `archive/`
+in the same bucket: stitched best-lead wind day files (hours 0–6 of each continental
+run, freshest run wins per UTC hour-slot) for the four protected-water regions,
+SSCOFS station series per cycle (valid ≤ run+6h), hourly obs snapshots, and a derived
+`archive/index.json`. All logic lives in `archive_util.py`; formats and invariants are
+documented in `cape_st_james/Model_Replay_Dev_Reference.md`. `python prune.py --before
+YYYYMMDD [--yes]` drops old days (manual only; refuses flagged dates). Offline tests:
+`python test_archive.py`.
+
 ## One-time setup
 
 ### 1. GitHub repo
