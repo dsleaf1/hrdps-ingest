@@ -174,6 +174,32 @@ def pack(speed_kmh, dir_deg):
     d = np.where(np.isnan(dir_deg), 0, np.round((dir_deg % 360) * 255.0 / 360.0)).astype("uint8")
     return s.tobytes() + d.tobytes()
 
+# ---------- season archive (Model Replay step 1) ----------
+ARCHIVE_LEAD_HOURS = 6
+# Step-0 region list: the steepness-layer protected waters (open coast excluded).
+ARCHIVE_REGIONS = ["broughtons-discovery", "northern-georgia-strait",
+                   "san-juan-gulf-islands", "puget-sound"]
+
+def archive_wind(c, keys, buffers, interps, times, run_dt):
+    """Retain hours 0..ARCHIVE_LEAD_HOURS of this run in the stitched best-lead day
+    files (archive/wind/<region>/<YYYYMMDD>.bin); the 4 daily runs tile a continuous
+    day, freshest run winning on overlap. Continental model only (caller gates)."""
+    import archive_util as au
+    bucket = os.environ["R2_BUCKET"]
+    run_iso = run_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for k in [k for k in keys if k in ARCHIVE_REGIONS]:
+        n = interps[k]["cols"] * interps[k]["rows"] * 2
+        buf = bytes(buffers[k])
+        blobs = []
+        for i, t in enumerate(times):
+            vt = dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+            if (vt - run_dt) <= dt.timedelta(hours=ARCHIVE_LEAD_HOURS):
+                blobs.append((vt, buf[i * n:(i + 1) * n]))
+        meta = {"bbox": bbox_of(k), "cols": interps[k]["cols"],
+                "rows": interps[k]["rows"], "res_deg": res_of(k)}
+        au.archive_wind_slots(c, bucket, k, meta, blobs, run_iso, log=log)
+    au.update_index(c, bucket, log=log)
+
 # ---------- R2 upload ----------
 def r2_client():
     import boto3
@@ -266,6 +292,11 @@ def main():
         for k in keys:
             r2_put(c, f"{k}.bin", bytes(buffers[k]), "application/octet-stream")
         log(f"Uploaded manifest + {len(keys)} region files to R2 ({M['prefix']}/)")
+        # Season archive is unconditional on continental upload runs (invariant 6);
+        # an archive failure must fail the job so GitHub alerts — that layer is the
+        # one that can't be regenerated. Latest-flow uploads above already landed.
+        if args.model == "continental":
+            archive_wind(c, keys, buffers, interps, times, run_dt)
 
 if __name__ == "__main__":
     main()

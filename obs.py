@@ -186,6 +186,11 @@ def main():
                   ContentEncoding="gzip", CacheControl="public, max-age=300")
     log("uploaded obs/latest.json")
     put_health(s3, bucket, {"consecutive_failures": 0, "last_success": now_iso})
+    # Season archive (Model Replay step 1): append this snapshot to the day doc.
+    # Unwrapped on purpose — an archive failure must fail the job and alert.
+    import archive_util as au
+    au.archive_obs_snapshot(s3, bucket, now_iso, stations, log=log)
+    au.update_index(s3, bucket, log=log)
 
 if __name__ == "__main__":
     main()

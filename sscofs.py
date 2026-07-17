@@ -274,5 +274,11 @@ def main():
         print("uploaded sscofs/stations.json",file=sys.stderr)
         try: archive_broughtons(stationlist, run, s3, BUCKET)      # long-term Broughtons record
         except Exception as e: print("archive failed:",e,file=sys.stderr)
+        # Season archive (Model Replay step 1): unwrapped on purpose — a failure here
+        # must fail the job and alert; the raw archive is the irreplaceable layer.
+        import archive_util as au
+        errlog=lambda *a: print(*a,file=sys.stderr)
+        au.archive_current_run(s3, BUCKET, run, stationlist, log=errlog)
+        au.update_index(s3, BUCKET, log=errlog)
 
 if __name__=="__main__": main()
