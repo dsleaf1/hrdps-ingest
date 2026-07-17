@@ -175,7 +175,10 @@ def pack(speed_kmh, dir_deg):
     return s.tobytes() + d.tobytes()
 
 # ---------- season archive (Model Replay step 1) ----------
-ARCHIVE_LEAD_HOURS = 6
+# 12 h = one full cron-cycle of overlap: a missed 6-hourly ingest degrades that
+# day's slots to 7-12 h lead instead of leaving a permanent hole; when runs do
+# arrive, freshest-wins overwrites the overlap so best-lead content is unchanged.
+ARCHIVE_LEAD_HOURS = 12
 # Step-0 region list: the steepness-layer protected waters (open coast excluded).
 ARCHIVE_REGIONS = ["broughtons-discovery", "northern-georgia-strait",
                    "san-juan-gulf-islands", "puget-sound"]
