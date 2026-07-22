@@ -12,8 +12,9 @@ Pipeline: find latest complete run -> download 10 m WIND (speed) + WDIR (directi
 model's native spacing -> byte-pack speed (km/h, 255=nodata) + direction (0..360->0..255) per
 hour -> gzip + upload per-region binaries + manifest.json to Cloudflare R2 under the model prefix.
 
-Alongside the six map regions (which do not tile the coast) there is an "overview" region
-covering the whole unified-map extent at ~2.5 km; see OVERVIEW_BBOX.
+Alongside the six map regions (which do not tile the coast) there are two whole-extent
+"overview" regions at ~2.5 km ("overview" = unified marine map, "coast-overview" = HRDPS-only
+coast map incl. Haida Gwaii); see OVERVIEWS.
 
 Local smoke test (needs eccodes + deps):
   python ingest.py --model hrdps_west --no-upload --regions haida-gwaii --max-hours 3
@@ -58,14 +59,20 @@ REGION_NAMES = {
     "haida-gwaii": "Haida Gwaii", "west-coast-vancouver-i": "West Coast Vancouver I.",
     "broughtons-discovery": "Broughtons & Discovery", "northern-georgia-strait": "Northern Georgia Strait",
     "san-juan-gulf-islands": "San Juan & Gulf Islands", "puget-sound": "Puget Sound",
-    "overview": "Whole extent (overview)",
+    "overview": "Whole extent (overview)", "coast-overview": "Whole coast (overview)",
 }
 
-# Whole-extent zoomed-out layer for the unified marine map (Unified_Marine_Map_Plan.md step 1).
-# The six regions above do NOT tile this extent: central Juan de Fuca (lon -124.8..-123.95 below
-# lat 48.3) and NE Queen Charlotte Sound (Cape Caution -> Rivers Inlet) fall in no region. Matches
-# sscofs.py's OVERVIEW_BBOX so the current and wind overviews share an extent.
-OVERVIEW_BBOX = [-129.0, 46.9, -122.0, 52.13]
+# Whole-extent zoomed-out layers. The six regions above do NOT tile these extents: central Juan
+# de Fuca (lon -124.8..-123.95 below lat 48.3) and NE Queen Charlotte Sound (Cape Caution ->
+# Rivers Inlet) fall in no region.
+# "overview" (unified marine map, Unified_Marine_Map_Plan.md step 1) matches sscofs.py's
+# OVERVIEW_BBOX so the current and wind overviews share an extent. "coast-overview" extends
+# north/west for the HRDPS-only coast map: Puget Sound -> Dixon Entrance incl. all Haida Gwaii
+# waters (also closes the Bella Bella hole between "overview" and "haida-gwaii").
+OVERVIEWS = {
+    "overview":       [-129.0, 46.9, -122.0, 52.13],
+    "coast-overview": [-133.6, 46.9, -122.0, 54.5],
+}
 OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
 
 def overview_res():
@@ -73,8 +80,8 @@ def overview_res():
     (at native 1 km this extent would be ~43 MB/run) while the 2.5 km model passes through."""
     return max(RES, OVERVIEW_RES)
 
-def bbox_of(key):  return OVERVIEW_BBOX if key == "overview" else REGIONS[key]
-def res_of(key):   return overview_res() if key == "overview" else RES
+def bbox_of(key):  return OVERVIEWS[key] if key in OVERVIEWS else REGIONS[key]
+def res_of(key):   return overview_res() if key in OVERVIEWS else RES
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
@@ -226,8 +233,8 @@ def main():
     args = ap.parse_args()
     M = MODELS[args.model]; RES = M["res"]
 
-    keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS) + ["overview"]
-    bad = [k for k in keys if k != "overview" and k not in REGIONS]
+    keys = [k.strip() for k in args.regions.split(",") if k.strip()] or list(REGIONS) + list(OVERVIEWS)
+    bad = [k for k in keys if k not in OVERVIEWS and k not in REGIONS]
     if bad:
         raise SystemExit("unknown region(s): " + ", ".join(bad))
     hours = M["hours"][: args.max_hours] if args.max_hours else M["hours"]
@@ -264,9 +271,11 @@ def main():
     if not times:
         raise RuntimeError("No forecast hours ingested")
 
-    # "overview" MUST come last: hrdps_summary.html picks the first region whose bbox contains the
-    # point, and the overview bbox contains them all -- ahead of them it would shadow every region.
-    mkeys = [k for k in keys if k != "overview"] + [k for k in keys if k == "overview"]
+    # Overviews MUST come last: hrdps_summary.html picks the first region whose bbox contains the
+    # point, and the overview bboxes contain them all -- ahead of them they would shadow every
+    # region. Within the overviews, "overview" stays ahead of "coast-overview" (same rule: the
+    # coast bbox contains the unified-map bbox).
+    mkeys = [k for k in keys if k not in OVERVIEWS] + [k for k in OVERVIEWS if k in keys]
     manifest = {
         "model": M["name"], "run": run_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generated": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
