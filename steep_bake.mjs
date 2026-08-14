@@ -288,6 +288,30 @@ if (needMesh) { buildMeshIndex(); log(`[${el()}] mesh indexed`); }
 const STEP_KM = DX * 111.32, MAX_STEPS = Math.ceil(FETCH_CAP_KM / STEP_KM);
 const SEC_STEP = 360 / FETCH_SECTORS;
 
+/* 🔑 ZONE OVERLAP — ONE ZONE CLAIMS EACH CELL (2026-08-13g, David's call after digest #137 measured
+   the defect). The STEEP_ZONES boxes INTERSECT (puget×ejdf, ejdf×sanjuan, sanjuan×georgia,
+   georgia×discovery, discovery×johnstone) and this baker used to emit a full rectangle per zone, so
+   water in two boxes was baked TWICE: 136,423 records for 98,706 distinct positions, 27.6%
+   duplicates, ~33% of the wire. The duplicates were verified identical — 0 band and 0 source-byte
+   disagreements over 1,734,982 duplicated cell-hours — which is why dropping them cannot change a
+   value: a cell's band does not depend on which zone computed it (the mask is padded by the full
+   60 km fetch cap, so the ray march is zone-independent too).
+   THE RULE IS THE CLIENT'S RULE: the FIRST zone in STEEP_ZONES order that contains the cell keeps
+   it. unified_map.html's loadSteepFineOnce() already de-duped this way (first zone wins, and before
+   that inSteepZone() was a some() test), so a de-duped bake needs NO client change — its `owner` map
+   simply finds nothing to drop and logs 0 duplicates.
+   ⚠ Ownership is tested against the FULL six-zone list, never the --zones selection, so a partial
+   bake claims exactly the cells a full bake would give it. A partial bake therefore has HOLES where
+   an unselected earlier zone owns the water — fine for --zones test work, never upload one. */
+const ZONE_IX = STEEP_ZONES.map(z => ({ ix0: gx(z[1][0]), ix1: gx(z[1][2]), iy0: gy(z[1][1]), iy1: gy(z[1][3]) }));
+function claimedEarlier(zi, iy, ix) {
+  for (let k = 0; k < zi; k++) {
+    const b = ZONE_IX[k];
+    if (ix >= b.ix0 && ix <= b.ix1 && iy >= b.iy0 && iy <= b.iy1) return true;
+  }
+  return false;
+}
+
 function buildZone(z) {
   const [W, S, E, N] = z.bbox;
   const ix0 = gx(W), ix1 = gx(E), iy0 = gy(S), iy1 = gy(N);
@@ -295,9 +319,8 @@ function buildZone(z) {
   const bbox = [+(LON0 + ix0 * DX).toFixed(4), +(LAT0 + iy0 * DX).toFixed(4),
                 +(LON0 + ix1 * DX).toFixed(4), +(LAT0 + iy1 * DX).toFixed(4)];
   const src = new Uint8Array(span);                     // 0 none / 1 surface / 2 mesh / 3 coarse
-  const cells = [];                                     // scored cells, in plane order
-  const lut = [];                                       // plane index of each scored cell
-  const cnt = { water: 0, surface: 0, mesh: 0, coarse: 0, none: 0 };
+  const cells = [];                                     // scored cells, in plane order (cell.j = plane index)
+  const cnt = { water: 0, ceded: 0, surface: 0, mesh: 0, coarse: 0, none: 0 };
   for (let r = 0; r < rows; r++) {
     const iy = iy1 - r;                                 // row 0 = NORTH, like the field tiles
     const la = LAT0 + iy * DX;
@@ -305,6 +328,7 @@ function buildZone(z) {
       const ix = ix0 + c, lo = LON0 + ix * DX, j = r * cols + c;
       if (!isWater(iy, ix)) continue;
       cnt.water++;
+      if (claimedEarlier(z.i, iy, ix)) { cnt.ceded++; continue; }   // an earlier zone owns this cell
       // --- resolve the current source once, statically: this is a COVERAGE question ---
       let pick = null;
       for (const p of PRIORITY) {
@@ -320,7 +344,6 @@ function buildZone(z) {
       let wj = Math.round((lo - wW) / wStepLon), wi = Math.round((wN - la) / wStepLat);
       wj = Math.min(Math.max(wj, 0), wCols - 1); wi = Math.min(Math.max(wi, 0), wRows - 1);
       cells.push({ j, iy, ix, lo, la, pick, wCell: wi * wCols + wj });
-      lut.push(j);
     }
   }
   /* DIRECTIONAL FETCH — static geometry, marched ONCE per bake, never per hour and never per run
@@ -339,11 +362,9 @@ function buildZone(z) {
       fetchKm[m * FETCH_SECTORS + s] = f;
     }
   }
-  /* rectangle slot → scored-cell ordinal, so the aggregator can find a fine cell's band without
-     storing a rectangle-shaped plane. −1 = not scored. */
-  const slot = new Int32Array(span).fill(-1);
-  for (let m = 0; m < nc; m++) slot[lut[m]] = m;
-  return { ...z, ix0, ix1, iy0, iy1, cols, rows, span, bbox, src, cells, slot, fetchKm, cnt };
+  /* (the old rectangle-slot → ordinal table lived here; the aggregator now indexes cells globally
+     by grid position instead, because its 4×4 block crosses zone edges — see fineAt below.) */
+  return { ...z, ix0, ix1, iy0, iy1, cols, rows, span, bbox, src, cells, fetchKm, cnt };
 }
 
 log(`[${el()}] building zone grids + fetch march…`);
@@ -351,7 +372,8 @@ const Z = ZONES.map(z => {
   const b = buildZone(z);
   log(`  zone ${b.i} ${b.name}: ${b.cols}×${b.rows} · ${b.cnt.water.toLocaleString()} water · scored ${b.cells.length.toLocaleString()}` +
       ` (surface ${b.cnt.surface.toLocaleString()} · mesh ${b.cnt.mesh.toLocaleString()} · coarse ${b.cnt.coarse.toLocaleString()}` +
-      ` · no current ${b.cnt.none.toLocaleString()})`);
+      ` · no current ${b.cnt.none.toLocaleString()}` +
+      ` · ceded to an earlier zone ${b.cnt.ceded.toLocaleString()})`);
   return b;
 });
 const totalCells = Z.reduce((a, z) => a + z.cells.length, 0);
@@ -366,6 +388,18 @@ for (const z of Z) {
 /* which fine cells belong to each overview cell: the 4×4 lattice block whose centre sample IS the
    overview point (offsets −1..+2, the rounding of the ±0.125/±0.375 sub-cell centres). */
 const AGG_OFF = [-1, 0, 1, 2];
+/* 🚨 THE SUB-CELL LOOKUP IS GLOBAL, NOT PER-ZONE — and it HAS to be, once each cell is claimed once.
+   A 2.2 km cell is assigned to the first zone whose box contains it, but its 4×4 fine block spans
+   ~2.24 km and can reach ACROSS the zone edge. This used to read only the claiming zone's own
+   rectangle and silently drop whatever fell outside it, so cells in the boundary strip aggregated
+   off a PARTIAL sample — a thinner denominator for the ≥25% rule. With de-duping, the ceded cells
+   would look like holes and that strip would get thinner still. Indexing every scored cell by its
+   global 0.56 km grid position fixes both: each 2.2 km cell now sees all sixteen of its sub-cells
+   wherever they are baked. ⚠ this CHANGES the zoom-out plane in the overlap strips (it is the one
+   part of the de-dupe that is not value-neutral) — measured and reported at the end of the bake. */
+const FKEY = (iy, ix) => iy * 4096 + ix;              // ix < 4096 across the whole SSCOFS grid
+const fineAt = new Map();
+for (const z of Z) for (let m = 0; m < z.cells.length; m++) fineAt.set(FKEY(z.cells[m].iy, z.cells[m].ix), { z, m });
 /* The zoom-out plane's own static index over the overview grid: which 2.2 km cells have any fine
    sub-cell to aggregate. Built before the hour loop so its packing order is fixed. */
 const aggIdx = new Uint8Array(oSpan);
@@ -379,14 +413,20 @@ for (const z of Z) for (let or2 = 0; or2 < oRows; or2++) {
     const cx = Math.round((lo - LON0) / DX);
     const sub = [];
     for (const dy of AGG_OFF) for (const dx of AGG_OFF) {
-      const r = z.iy1 - (cy + dy), c = (cx + dx) - z.ix0;
-      if (r < 0 || r >= z.rows || c < 0 || c >= z.cols) continue;
-      const m = z.slot[r * z.cols + c]; if (m >= 0) sub.push(m);
+      const g = fineAt.get(FKEY(cy + dy, cx + dx)); if (g) sub.push(g);
     }
     if (!sub.length) continue;
-    aggIdx[oi] = 1; aggCells.push({ oi, z, sub });
+    aggIdx[oi] = 1; aggCells.push({ oi, sub });
   }
 }
+/* 🚨 PACK IN GRID ORDER. The loop above walks ZONE-BY-ZONE, so without this sort the plane's
+   ordinals are grouped by zone and a reader that rebuilds them the documented way — walk the index
+   plane, count set bytes, as the fine planes' LUT is built from the source plane — would read the
+   whole plane SCRAMBLED. Nothing consumes agg2200.bin yet (unified_map.html fetches only the six
+   zones' band/src/exp), so nothing is broken live; this makes the file mean what the manifest says
+   before anything does consume it, and makes the packing deterministic instead of a by-product of
+   which zone happened to claim each cell. */
+aggCells.sort((p, q) => p.oi - q.oi);
 const aggN = aggCells.length;
 const agg = new Uint8Array(aggN * TIMES.length).fill(B_NODATA);
 log(`[${el()}] zoom-out: ${aggN.toLocaleString()} of ${oSpan.toLocaleString()} 2.2 km cells have fine sub-cells`);
@@ -445,9 +485,9 @@ for (let hi = 0; hi < TIMES.length; hi++) {
      back at ≥25% ADDS them (→9.58%). It is the threshold adding marks, not the resolution. */
   const aggOff = hi * aggN;
   for (let a = 0; a < aggN; a++) {
-    const A = aggCells[a], bandOff = hi * A.z.cells.length;
+    const A = aggCells[a];
     let n = 0; const at = [0, 0, 0, 0, 0];
-    for (const m of A.sub) { const v = A.z.band[bandOff + m]; if (v === B_NODATA) continue; n++; if (v !== B_NOSEA) at[v]++; }
+    for (const s of A.sub) { const v = s.z.band[hi * s.z.cells.length + s.m]; if (v === B_NODATA) continue; n++; if (v !== B_NOSEA) at[v]++; }
     if (!n) continue;
     let painted = 0;
     for (let B = 4; B >= 1; B--) { let k = 0; for (let b = B; b <= 4; b++) k += at[b];

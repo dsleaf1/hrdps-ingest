@@ -1,5 +1,7 @@
 out/
 steep_out/
+field_out/
+mesh_out/
 *.grib2
 *.idx
 __pycache__/
