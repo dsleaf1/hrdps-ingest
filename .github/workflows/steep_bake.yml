@@ -1,0 +1,94 @@
+name: Steepness bake (0.56 km)
+
+# 🔑 BOTH UPSTREAM TRIGGERS — David's option A, digest #134.
+# The bake needs a CURRENT run and a WIND run together, and they are separate jobs at different
+# times: HRDPS lands at :05 past 05/11/17/23 UTC and the SSCOFS field job at :50 past 06/12/18/00,
+# so wind refreshes 1 h 45 m BEFORE the field job. Triggering off the field job alone would leave
+# the Wind layer a run ahead of the rings roughly 29% of the clock. The bake is ~85 s on an M1, so
+# 8 bakes a day instead of 4 costs nothing.
+# ⛔ The rejected alternative was option C: require the two run stamps to MATCH and otherwise fall
+# back. Do not revive it — a layer whose mark density flickers with job timing is worse than one
+# consistently a couple of hours behind, because the user has no model for it.
+# ⚠ "HRDPS ingest" also runs the 1 km west nest twice a day and a decode-only test mode; those
+# completions fire this too. Harmless (it just re-bakes whatever is currently in R2), and the
+# manifest records both run stamps, so what a given bake was built from is always visible.
+
+on:
+  workflow_run:
+    workflows: ["HRDPS ingest", "SSCOFS current field"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = bake + upload to R2 ; test = 6 h, one zone, no upload"
+        type: choice
+        options: [full, test]
+        default: full
+      zones:
+        description: "comma-separated zone indices (blank = all six)"
+        default: ""
+      build_mask:
+        description: "rebuild the static 0.56 km water mask from OPeNDAP first (rarely needed — it is bathymetry)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: steep-bake
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    # Only chase a successful upstream run: baking off a failed ingest would pair a fresh
+    # manifest with stale or partial bytes.
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+
+      # Static geometry: the SSCOFS land/sea mask is identical in every cycle, so it lives in R2
+      # and the bake downloads it. This step exists for the first run and for a grid change.
+      - name: Rebuild the static 0.56 km water mask
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_mask == 'true' }}
+        run: node steep_mask.mjs --out steep_out
+      - name: Upload the static mask
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_mask == 'true' }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 steep_upload.py steep_out --static
+
+      - name: Bake the 0.56 km steepness band
+        if: ${{ github.event_name == 'workflow_run' || github.event.inputs.mode == 'full' }}
+        env:
+          # recorded verbatim in the manifest, so a bad bake can be traced to what woke it
+          STEEP_TRIGGER: ${{ github.event_name == 'workflow_run' && format('workflow_run:{0}#{1}', github.event.workflow_run.name, github.event.workflow_run.id) || 'workflow_dispatch' }}
+        run: node --max-old-space-size=6144 steep_bake.mjs --mask steep_out --out steep_out --zones "${{ github.event.inputs.zones }}"
+
+      - name: Upload to R2 (sscofs/steep/ only — never sscofs/field/)
+        if: ${{ github.event_name == 'workflow_run' || github.event.inputs.mode == 'full' }}
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 steep_upload.py steep_out
+
+      - name: Test (6 h, one zone, no upload)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: node steep_bake.mjs --mask steep_out --out steep_out --hours 6 --zones "${{ github.event.inputs.zones || '2' }}" --compare
+      - name: Upload test output
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: steep-test
+          path: steep_out/

@@ -1,4 +1,5 @@
 out/
+steep_out/
 *.grib2
 *.idx
 __pycache__/
