@@ -37,6 +37,11 @@ FORMATS = {
                  "packing to the live per-region .bin, one hour per slot. Dims and per-slot "
                  "source run are in the <YYYYMMDD>.json sidecar."),
     "wind_sidecar": "{v, date, region, bbox[W,S,E,N], cols, rows, res_deg, src: [24 x run ISO | null]}",
+    "current_field_bin": ("24 UTC hour slots (00..23Z), fixed size. Per slot: cols*rows uint8 "
+                         "current speed kt*10 (255 = nodata) then cols*rows uint8 direction-toward "
+                         "(bearing*255/360). Same binary packing as sscofs/field/overview.bin."),
+    "current_field_sidecar": ("{v, date, bbox[W,S,E,N], cols, rows, res_deg, speed_unit, "
+                              "dir_convention, src: [24 x run ISO | null]}"),
     "current": ("{v, date, runs: [{run, stations: [{name, region, lat, lon, "
                 "ev: [[epoch_ms, u_kt, v_kt], ...]}]}]} — each SSCOFS cycle's series trimmed "
                 "to valid <= run+6h (nowcast + best-lead forecast), points filed under their "
@@ -119,7 +124,61 @@ def archive_wind_slots(s3, bucket, region, meta, blobs, run_iso, log=_noop):
         log(f"  archive wind {region}/{date}: {wrote}/{len(slots)} slots from run {run_iso}")
     return written
 
-# ---------- SSCOFS currents ----------
+# ---------- SSCOFS current field (overview grid) ----------
+def _nodata_current_slot(cols, rows):
+    return b"\xff" * (cols * rows) + b"\x00" * (cols * rows)
+
+def archive_current_field(s3, bucket, run, hours_ms, overview_blob, meta, lead_hours=12, log=_noop):
+    """Retain overview-grid current in stitched best-lead day files, mirroring
+    archive_wind_slots. overview_blob = packed bytes from pack_field (all forecast
+    hours concatenated); hours_ms = valid-time epoch-ms per forecast hour; meta =
+    {bbox, cols, rows, res_deg}. Packing: per slot cols*rows speed (kt*10, 255=nodata)
+    then cols*rows direction-toward (bearing*255/360)."""
+    cols, rows = meta["cols"], meta["rows"]
+    n = cols * rows * 2
+    run_iso = run.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff = run + dt.timedelta(hours=lead_hours)
+    bydate = {}
+    for i, ms in enumerate(hours_ms):
+        vt = dt.datetime.fromtimestamp(ms / 1000, UTC)
+        if vt > cutoff:
+            break
+        blob = overview_blob[i * n:(i + 1) * n]
+        if len(blob) != n:
+            break
+        bydate.setdefault(vt.strftime("%Y%m%d"), []).append((vt.hour, blob))
+    written = {}
+    for date, slots in sorted(bydate.items()):
+        bkey = f"archive/current_field/{date}.bin"
+        skey = f"archive/current_field/{date}.json"
+        day = get_gz(s3, bucket, bkey)
+        side = get_json(s3, bucket, skey)
+        if (day is None or side is None or len(day) != 24 * n
+                or side.get("cols") != cols or side.get("rows") != rows):
+            if day is not None:
+                log(f"  archive current_field {date}: dims changed, reinitializing")
+            day = bytearray(_nodata_current_slot(cols, rows) * 24)
+            side = {"v": V, "date": date, "bbox": meta["bbox"],
+                    "cols": cols, "rows": rows, "res_deg": meta["res_deg"],
+                    "speed_unit": "kt_x10", "dir_convention": "toward",
+                    "src": [None] * 24}
+        else:
+            day = bytearray(day)
+        wrote = 0
+        for hour, blob in slots:
+            prev = side["src"][hour]
+            if prev is None or prev <= run_iso:
+                day[hour * n:(hour + 1) * n] = blob
+                side["src"][hour] = run_iso
+                wrote += 1
+        if wrote:
+            put_gz(s3, bucket, bkey, bytes(day), "application/octet-stream")
+            put_json(s3, bucket, skey, side)
+        written[date] = wrote
+        log(f"  archive current_field {date}: {wrote}/{len(slots)} slots from run {run_iso}")
+    return written
+
+# ---------- SSCOFS currents (station series) ----------
 def archive_current_run(s3, bucket, run, stationlist, lead_hours=6, log=_noop):
     """File one SSCOFS cycle's station series (valid <= run+lead_hours, i.e. the
     5 nowcast hours + best-lead forecast) into per-day archive docs; a series
@@ -165,6 +224,7 @@ def archive_obs_snapshot(s3, bucket, now_iso, stations, log=_noop):
 
 # ---------- index ----------
 _WIND_RE = re.compile(r"^archive/wind/(?!full/)([^/]+)/(\d{8})\.bin$")
+_CURFIELD_RE = re.compile(r"^archive/current_field/(\d{8})\.bin$")
 _CUR_RE = re.compile(r"^archive/current/(\d{8})\.json$")
 _OBS_RE = re.compile(r"^archive/obs/(\d{8})\.json$")
 
@@ -187,11 +247,15 @@ def update_index(s3, bucket, log=_noop):
     """Rebuild archive/index.json (dates available, regions, stored sizes) from a
     bucket LIST so the replay viewer can enumerate without listing the bucket."""
     keys = list_archive(s3, bucket)
-    wind, current, obs = {}, {}, {}
+    wind, current_field, current, obs = {}, {}, {}, {}
     for k, size in keys.items():
         m = _WIND_RE.match(k)
         if m:
             wind.setdefault(m.group(1), {})[m.group(2)] = size
+            continue
+        m = _CURFIELD_RE.match(k)
+        if m:
+            current_field[m.group(1)] = size
             continue
         m = _CUR_RE.match(k)
         if m:
@@ -203,10 +267,12 @@ def update_index(s3, bucket, log=_noop):
     idx = {"v": V,
            "generated": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "note": "sizes are stored (gzip) bytes; wind sidecar = same path .json",
-           "formats": FORMATS, "wind": wind, "current": current, "obs": obs}
+           "formats": FORMATS, "wind": wind, "current_field": current_field,
+           "current": current, "obs": obs}
     put_json(s3, bucket, "archive/index.json", idx)
     log(f"  archive index: {sum(len(d) for d in wind.values())} wind day-files, "
-        f"{len(current)} current days, {len(obs)} obs days")
+        f"{len(current_field)} current-field days, {len(current)} current days, "
+        f"{len(obs)} obs days")
     return idx
 
 # ---------- prune ----------
@@ -216,7 +282,7 @@ def pinned_dates(s3, bucket):
     raw = get_gz(s3, bucket, "archive/flags.json")
     return set() if raw is None else {m.decode() for m in re.findall(rb"\d{8}", raw)}
 
-_DAY_RE = re.compile(r"^archive/(?:wind/(?!full/)[^/]+|current|obs)/(\d{8})\.(?:bin|json)$")
+_DAY_RE = re.compile(r"^archive/(?:wind/(?!full/)[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
 
 def prune_days(s3, bucket, before, delete=False, log=_noop):
     """Drop per-day archive objects strictly older than `before` (YYYYMMDD). Never

@@ -153,6 +153,14 @@ def field_main(a):
         s3.put_object(Bucket=BUCKET,Key=f"sscofs/field/{reg}.bin",Body=gzip.compress(b),
             ContentType="application/octet-stream",ContentEncoding="gzip",CacheControl="max-age=900")
     print(f"uploaded sscofs/field/manifest.json + {len(blobs)} region tiles",file=sys.stderr)
+    if "overview" in blobs:
+        import archive_util as au
+        errlog=lambda *a: print(*a,file=sys.stderr)
+        rmeta=manifest["regions"]["overview"]
+        au.archive_current_field(s3, BUCKET, run, hours_ms,
+            blobs["overview"], {"bbox":rmeta["bbox"], "cols":rmeta["cols"],
+            "rows":rmeta["rows"], "res_deg":rmeta["res_deg"]}, log=errlog)
+        au.update_index(s3, BUCKET, log=errlog)
 
 def latest_cycle():
     for back in range(2):
