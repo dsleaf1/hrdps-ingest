@@ -1,0 +1,73 @@
+name: Divergence scan (nightly)
+
+# Nightly scan: compare 4 model combos over each archived day's overview-grid cells.
+# Runs at 07:15 UTC — after the last SSCOFS field job of the day (00:50 UTC) and well
+# after the archive has settled, so today's current_field day file is complete.
+# Also runnable manually for one-off scans or full-season rebuilds.
+
+on:
+  schedule:
+    - cron: "15 7 * * *"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "new = scan unscanned days ; rebuild = re-scan entire archive ; date = single day"
+        type: choice
+        options: [new, rebuild, date]
+        default: new
+      date:
+        description: "YYYYMMDD (only for mode=date)"
+        default: ""
+      end:
+        description: "YYYYMMDD end of range (only for mode=date, optional)"
+        default: ""
+
+concurrency:
+  group: divergence-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install boto3
+
+      - name: Run divergence scan
+        id: scan
+        run: |
+          MODE="${{ github.event.inputs.mode || 'new' }}"
+          ARGS="--out scan_out"
+          if [ "$MODE" = "new" ]; then
+            ARGS="$ARGS --new"
+          elif [ "$MODE" = "rebuild" ]; then
+            ARGS="$ARGS --rebuild"
+          elif [ "$MODE" = "date" ]; then
+            ARGS="$ARGS --date ${{ github.event.inputs.date }}"
+            if [ -n "${{ github.event.inputs.end }}" ]; then
+              ARGS="$ARGS --end ${{ github.event.inputs.end }}"
+            fi
+          fi
+          node divergence_scan.mjs $ARGS
+
+      - name: Upload to R2
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python3 divergence_upload.py scan_out
+
+      - name: Upload scan output as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: divergence-scan
+          path: scan_out/
