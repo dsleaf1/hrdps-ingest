@@ -157,9 +157,23 @@ def field_main(a):
         import archive_util as au
         errlog=lambda *a: print(*a,file=sys.stderr)
         rmeta=manifest["regions"]["overview"]
+        meta={"bbox":rmeta["bbox"], "cols":rmeta["cols"],
+              "rows":rmeta["rows"], "res_deg":rmeta["res_deg"]}
         au.archive_current_field(s3, BUCKET, run, hours_ms,
-            blobs["overview"], {"bbox":rmeta["bbox"], "cols":rmeta["cols"],
-            "rows":rmeta["rows"], "res_deg":rmeta["res_deg"]}, log=errlog)
+            blobs["overview"], meta, log=errlog)
+        # Per-run volatility archive (overview grid only)
+        n=rmeta["cols"]*rmeta["rows"]*2
+        VOLATILITY_LEAD_HOURS=18
+        vol_blobs=[]
+        for i,ms in enumerate(hours_ms):
+            vt=dt.datetime.fromtimestamp(ms/1000, dt.timezone.utc)
+            if (vt-run)<=dt.timedelta(hours=VOLATILITY_LEAD_HOURS):
+                chunk=blobs["overview"][i*n:(i+1)*n]
+                if len(chunk)==n:
+                    vol_blobs.append((vt, chunk))
+        au.archive_wind_runs(s3, BUCKET, "overview", meta, vol_blobs,
+            run.strftime("%Y-%m-%dT%H:%M:%SZ"), run,
+            prefix="current_runs", log=errlog)
         au.update_index(s3, BUCKET, log=errlog)
 
 def latest_cycle():

@@ -42,6 +42,11 @@ FORMATS = {
                       "and lead times recorded in the .json sidecar."),
     "wind_runs_sidecar": ("{v, date, region, bbox[W,S,E,N], cols, rows, res_deg, "
                           "runs: [{run: ISO, slots: [lead_h|null x 24]}]}"),
+    "current_runs_bin": ("Per-run volatility archive for SSCOFS overview-grid currents. "
+                        "Same layout as wind_runs_bin: N_runs x 24 UTC hour slots, "
+                        "speed kt*10 + direction-toward per cell."),
+    "current_runs_sidecar": ("{v, date, region, bbox[W,S,E,N], cols, rows, res_deg, "
+                             "runs: [{run: ISO, slots: [lead_h|null x 24]}]}"),
     "current_field_bin": ("24 UTC hour slots (00..23Z), fixed size. Per slot: cols*rows uint8 "
                          "current speed kt*10 (255 = nodata) then cols*rows uint8 direction-toward "
                          "(bearing*255/360). Same binary packing as sscofs/field/overview.bin."),
@@ -308,6 +313,7 @@ def archive_obs_snapshot(s3, bucket, now_iso, stations, log=_noop):
 _WIND_RE = re.compile(r"^archive/wind/(?!full/)([^/]+)/(\d{8})\.bin$")
 _WIND_RUNS_RE = re.compile(r"^archive/wind_runs/([^/]+)/(\d{8})\.bin$")
 _WIND_RUNS_1K_RE = re.compile(r"^archive/wind_runs_1km/([^/]+)/(\d{8})\.bin$")
+_CUR_RUNS_RE = re.compile(r"^archive/current_runs/([^/]+)/(\d{8})\.bin$")
 _CURFIELD_RE = re.compile(r"^archive/current_field/(\d{8})\.bin$")
 _CUR_RE = re.compile(r"^archive/current/(\d{8})\.json$")
 _OBS_RE = re.compile(r"^archive/obs/(\d{8})\.json$")
@@ -332,6 +338,7 @@ def update_index(s3, bucket, log=_noop):
     bucket LIST so the replay viewer can enumerate without listing the bucket."""
     keys = list_archive(s3, bucket)
     wind, wind_runs, wind_runs_1km = {}, {}, {}
+    current_runs = {}
     current_field, current, obs = {}, {}, {}
     for k, size in keys.items():
         m = _WIND_RE.match(k)
@@ -345,6 +352,10 @@ def update_index(s3, bucket, log=_noop):
         m = _WIND_RUNS_1K_RE.match(k)
         if m:
             wind_runs_1km.setdefault(m.group(1), {})[m.group(2)] = size
+            continue
+        m = _CUR_RUNS_RE.match(k)
+        if m:
+            current_runs.setdefault(m.group(1), {})[m.group(2)] = size
             continue
         m = _CURFIELD_RE.match(k)
         if m:
@@ -364,12 +375,16 @@ def update_index(s3, bucket, log=_noop):
            "current_field": current_field, "current": current, "obs": obs}
     if wind_runs_1km:
         idx["wind_runs_1km"] = wind_runs_1km
+    if current_runs:
+        idx["current_runs"] = current_runs
     put_json(s3, bucket, "archive/index.json", idx)
     wr_count = sum(len(d) for d in wind_runs.values())
     wr1k_count = sum(len(d) for d in wind_runs_1km.values())
+    cr_count = sum(len(d) for d in current_runs.values())
     log(f"  archive index: {sum(len(d) for d in wind.values())} wind day-files, "
         f"{wr_count} wind-runs day-files"
-        + (f", {wr1k_count} wind-runs-1km day-files" if wr1k_count else "") +
+        + (f", {wr1k_count} wind-runs-1km day-files" if wr1k_count else "")
+        + (f", {cr_count} current-runs day-files" if cr_count else "") +
         f", {len(current_field)} current-field days, {len(current)} current days, "
         f"{len(obs)} obs days")
     return idx
@@ -381,7 +396,7 @@ def pinned_dates(s3, bucket):
     raw = get_gz(s3, bucket, "archive/flags.json")
     return set() if raw is None else {m.decode() for m in re.findall(rb"\d{8}", raw)}
 
-_DAY_RE = re.compile(r"^archive/(?:wind(?:_runs(?:_1km)?)?/(?!full/)[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
+_DAY_RE = re.compile(r"^archive/(?:wind(?:_runs(?:_1km)?)?/(?!full/)[^/]+|current_runs/[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
 
 def prune_days(s3, bucket, before, delete=False, log=_noop):
     """Drop per-day archive objects strictly older than `before` (YYYYMMDD). Never
