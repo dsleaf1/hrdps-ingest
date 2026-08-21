@@ -37,6 +37,11 @@ FORMATS = {
                  "packing to the live per-region .bin, one hour per slot. Dims and per-slot "
                  "source run are in the <YYYYMMDD>.json sidecar."),
     "wind_sidecar": "{v, date, region, bbox[W,S,E,N], cols, rows, res_deg, src: [24 x run ISO | null]}",
+    "wind_runs_bin": ("Per-run volatility archive. N_runs x 24 UTC hour slots, same "
+                      "per-slot packing as wind_bin. Runs stacked consecutively; order "
+                      "and lead times recorded in the .json sidecar."),
+    "wind_runs_sidecar": ("{v, date, region, bbox[W,S,E,N], cols, rows, res_deg, "
+                          "runs: [{run: ISO, slots: [lead_h|null x 24]}]}"),
     "current_field_bin": ("24 UTC hour slots (00..23Z), fixed size. Per slot: cols*rows uint8 "
                          "current speed kt*10 (255 = nodata) then cols*rows uint8 direction-toward "
                          "(bearing*255/360). Same binary packing as sscofs/field/overview.bin."),
@@ -123,6 +128,83 @@ def archive_wind_slots(s3, bucket, region, meta, blobs, run_iso, log=_noop):
         written[date] = wrote
         log(f"  archive wind {region}/{date}: {wrote}/{len(slots)} slots from run {run_iso}")
     return written
+
+# ---------- wind runs (per-run volatility archive) ----------
+def archive_wind_runs(s3, bucket, region, meta, blobs, run_iso, run_dt,
+                      prefix="wind_runs", log=_noop):
+    """Store one run's predictions without overwriting earlier runs, so every run's
+    view of a given valid hour is retained for cross-run spread analysis.
+
+    Same slot packing as the stitched day file (speed bytes then direction bytes,
+    row 0 = north) but with one 24-slot layer per model run.  Re-running a cycle
+    replaces its layer; otherwise layers accumulate.
+
+    blobs = [(valid_dt_utc, slot_bytes), ...]; run_dt = run initialisation datetime.
+    prefix controls the R2 path (wind_runs for 2.5 km, wind_runs_1km for 1 km).
+    Runs are kept in arrival order (the analysis script sorts by run ISO when needed)."""
+    cols, rows = meta["cols"], meta["rows"]
+    n = cols * rows * 2
+    bydate = {}
+    for vt, blob in blobs:
+        if len(blob) != n:
+            raise ValueError(f"blob size {len(blob)} != {n} for {region}")
+        lead_h = round((vt - run_dt).total_seconds() / 3600)
+        bydate.setdefault(vt.strftime("%Y%m%d"), []).append((vt.hour, lead_h, blob))
+
+    written = {}
+    for date, slots in sorted(bydate.items()):
+        bkey = f"archive/{prefix}/{region}/{date}.bin"
+        skey = f"archive/{prefix}/{region}/{date}.json"
+
+        side = get_json(s3, bucket, skey)
+        if side is None or side.get("cols") != cols or side.get("rows") != rows:
+            if side is not None:
+                log(f"  {prefix} {region}/{date}: dims changed, reinitializing")
+            side = {"v": V, "date": date, "region": region, "bbox": meta["bbox"],
+                    "cols": cols, "rows": rows, "res_deg": meta["res_deg"], "runs": []}
+            day_bin = bytearray()
+        else:
+            raw = get_gz(s3, bucket, bkey)
+            day_bin = bytearray(raw) if raw else bytearray()
+
+        # Find existing layer for this run, or allocate a new one
+        run_idx = None
+        for i, r in enumerate(side["runs"]):
+            if r["run"] == run_iso:
+                run_idx = i
+                break
+
+        if run_idx is None:
+            run_idx = len(side["runs"])
+            side["runs"].append({"run": run_iso, "slots": [None] * 24})
+            day_bin.extend(_nodata_slot(cols, rows) * 24)
+
+        # Defensive: if the bin doesn't match the sidecar, reinitialize with this run
+        expected = len(side["runs"]) * 24 * n
+        if len(day_bin) != expected:
+            log(f"  {prefix} {region}/{date}: bin size {len(day_bin)} != expected "
+                f"{expected}, reinitializing")
+            side["runs"] = [{"run": run_iso, "slots": [None] * 24}]
+            run_idx = 0
+            day_bin = bytearray(_nodata_slot(cols, rows) * 24)
+
+        wrote = 0
+        for hour, lead_h, blob in slots:
+            offset = (run_idx * 24 + hour) * n
+            day_bin[offset:offset + n] = blob
+            side["runs"][run_idx]["slots"][hour] = lead_h
+            wrote += 1
+
+        if wrote:
+            put_gz(s3, bucket, bkey, bytes(day_bin), "application/octet-stream")
+            put_json(s3, bucket, skey, side)
+
+        written[date] = wrote
+        log(f"  {prefix} {region}/{date}: {wrote} slots from run {run_iso} "
+            f"({len(side['runs'])} runs on file)")
+
+    return written
+
 
 # ---------- SSCOFS current field (overview grid) ----------
 def _nodata_current_slot(cols, rows):
@@ -224,6 +306,8 @@ def archive_obs_snapshot(s3, bucket, now_iso, stations, log=_noop):
 
 # ---------- index ----------
 _WIND_RE = re.compile(r"^archive/wind/(?!full/)([^/]+)/(\d{8})\.bin$")
+_WIND_RUNS_RE = re.compile(r"^archive/wind_runs/([^/]+)/(\d{8})\.bin$")
+_WIND_RUNS_1K_RE = re.compile(r"^archive/wind_runs_1km/([^/]+)/(\d{8})\.bin$")
 _CURFIELD_RE = re.compile(r"^archive/current_field/(\d{8})\.bin$")
 _CUR_RE = re.compile(r"^archive/current/(\d{8})\.json$")
 _OBS_RE = re.compile(r"^archive/obs/(\d{8})\.json$")
@@ -247,11 +331,20 @@ def update_index(s3, bucket, log=_noop):
     """Rebuild archive/index.json (dates available, regions, stored sizes) from a
     bucket LIST so the replay viewer can enumerate without listing the bucket."""
     keys = list_archive(s3, bucket)
-    wind, current_field, current, obs = {}, {}, {}, {}
+    wind, wind_runs, wind_runs_1km = {}, {}, {}
+    current_field, current, obs = {}, {}, {}
     for k, size in keys.items():
         m = _WIND_RE.match(k)
         if m:
             wind.setdefault(m.group(1), {})[m.group(2)] = size
+            continue
+        m = _WIND_RUNS_RE.match(k)
+        if m:
+            wind_runs.setdefault(m.group(1), {})[m.group(2)] = size
+            continue
+        m = _WIND_RUNS_1K_RE.match(k)
+        if m:
+            wind_runs_1km.setdefault(m.group(1), {})[m.group(2)] = size
             continue
         m = _CURFIELD_RE.match(k)
         if m:
@@ -267,11 +360,17 @@ def update_index(s3, bucket, log=_noop):
     idx = {"v": V,
            "generated": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "note": "sizes are stored (gzip) bytes; wind sidecar = same path .json",
-           "formats": FORMATS, "wind": wind, "current_field": current_field,
-           "current": current, "obs": obs}
+           "formats": FORMATS, "wind": wind, "wind_runs": wind_runs,
+           "current_field": current_field, "current": current, "obs": obs}
+    if wind_runs_1km:
+        idx["wind_runs_1km"] = wind_runs_1km
     put_json(s3, bucket, "archive/index.json", idx)
+    wr_count = sum(len(d) for d in wind_runs.values())
+    wr1k_count = sum(len(d) for d in wind_runs_1km.values())
     log(f"  archive index: {sum(len(d) for d in wind.values())} wind day-files, "
-        f"{len(current_field)} current-field days, {len(current)} current days, "
+        f"{wr_count} wind-runs day-files"
+        + (f", {wr1k_count} wind-runs-1km day-files" if wr1k_count else "") +
+        f", {len(current_field)} current-field days, {len(current)} current days, "
         f"{len(obs)} obs days")
     return idx
 
@@ -282,7 +381,7 @@ def pinned_dates(s3, bucket):
     raw = get_gz(s3, bucket, "archive/flags.json")
     return set() if raw is None else {m.decode() for m in re.findall(rb"\d{8}", raw)}
 
-_DAY_RE = re.compile(r"^archive/(?:wind/(?!full/)[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
+_DAY_RE = re.compile(r"^archive/(?:wind(?:_runs(?:_1km)?)?/(?!full/)[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
 
 def prune_days(s3, bucket, before, delete=False, log=_noop):
     """Drop per-day archive objects strictly older than `before` (YYYYMMDD). Never

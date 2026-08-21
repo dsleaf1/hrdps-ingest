@@ -186,28 +186,42 @@ def pack(speed_kmh, dir_deg):
 # day's slots to 7-12 h lead instead of leaving a permanent hole; when runs do
 # arrive, freshest-wins overwrites the overlap so best-lead content is unchanged.
 ARCHIVE_LEAD_HOURS = 12
+VOLATILITY_LEAD_HOURS = 18
 # Step-0 region list: the steepness-layer protected waters (open coast excluded).
 ARCHIVE_REGIONS = ["broughtons-discovery", "northern-georgia-strait",
                    "san-juan-gulf-islands", "puget-sound"]
 
-def archive_wind(c, keys, buffers, interps, times, run_dt):
-    """Retain hours 0..ARCHIVE_LEAD_HOURS of this run in the stitched best-lead day
-    files (archive/wind/<region>/<YYYYMMDD>.bin); the 4 daily runs tile a continuous
-    day, freshest run winning on overlap. Continental model only (caller gates)."""
+def archive_wind(c, keys, buffers, interps, times, run_dt, model="continental"):
+    """Retain short-lead hours in two parallel archives:
+    1. Stitched best-lead day files (continental only, unchanged behaviour)
+    2. Per-run volatility archive — keeps every run's prediction so cross-run
+       spread can be measured later.  Both models (2.5 km + 1 km)."""
     import archive_util as au
     bucket = os.environ["R2_BUCKET"]
     run_iso = run_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     for k in [k for k in keys if k in ARCHIVE_REGIONS]:
         n = interps[k]["cols"] * interps[k]["rows"] * 2
         buf = bytes(buffers[k])
-        blobs = []
-        for i, t in enumerate(times):
-            vt = dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
-            if (vt - run_dt) <= dt.timedelta(hours=ARCHIVE_LEAD_HOURS):
-                blobs.append((vt, buf[i * n:(i + 1) * n]))
         meta = {"bbox": bbox_of(k), "cols": interps[k]["cols"],
                 "rows": interps[k]["rows"], "res_deg": res_of(k)}
-        au.archive_wind_slots(c, bucket, k, meta, blobs, run_iso, log=log)
+
+        if model == "continental":
+            blobs = []
+            for i, t in enumerate(times):
+                vt = dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+                if (vt - run_dt) <= dt.timedelta(hours=ARCHIVE_LEAD_HOURS):
+                    blobs.append((vt, buf[i * n:(i + 1) * n]))
+            au.archive_wind_slots(c, bucket, k, meta, blobs, run_iso, log=log)
+
+        vol_blobs = []
+        for i, t in enumerate(times):
+            vt = dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+            if (vt - run_dt) <= dt.timedelta(hours=VOLATILITY_LEAD_HOURS):
+                vol_blobs.append((vt, buf[i * n:(i + 1) * n]))
+        prefix = "wind_runs" if model == "continental" else "wind_runs_1km"
+        au.archive_wind_runs(c, bucket, k, meta, vol_blobs, run_iso, run_dt,
+                             prefix=prefix, log=log)
+
     au.update_index(c, bucket, log=log)
 
 # ---------- R2 upload ----------
@@ -304,11 +318,10 @@ def main():
         for k in keys:
             r2_put(c, f"{k}.bin", bytes(buffers[k]), "application/octet-stream")
         log(f"Uploaded manifest + {len(keys)} region files to R2 ({M['prefix']}/)")
-        # Season archive is unconditional on continental upload runs (invariant 6);
-        # an archive failure must fail the job so GitHub alerts — that layer is the
-        # one that can't be regenerated. Latest-flow uploads above already landed.
-        if args.model == "continental":
-            archive_wind(c, keys, buffers, interps, times, run_dt)
+        # Archive is unconditional on upload runs (invariant 6); an archive failure
+        # must fail the job so GitHub alerts. Stitched best-lead runs for continental
+        # only; per-run volatility archive runs for both models.
+        archive_wind(c, keys, buffers, interps, times, run_dt, model=args.model)
 
 if __name__ == "__main__":
     main()
