@@ -12,9 +12,9 @@ Pipeline: find latest complete run -> download 10 m WIND (speed) + WDIR (directi
 model's native spacing -> byte-pack speed (km/h, 255=nodata) + direction (0..360->0..255) per
 hour -> gzip + upload per-region binaries + manifest.json to Cloudflare R2 under the model prefix.
 
-Alongside the six map regions (which do not tile the coast) there are two whole-extent
+Alongside the six map regions (which do not tile the coast) there are three whole-extent
 "overview" regions at ~2.5 km ("overview" = unified marine map, "coast-overview" = HRDPS-only
-coast map incl. Haida Gwaii); see OVERVIEWS.
+coast map incl. Haida Gwaii, "pnw-rockies" = PNW & Rockies wind map); see OVERVIEWS.
 
 Local smoke test (needs eccodes + deps):
   python ingest.py --model hrdps_west --no-upload --regions haida-gwaii --max-hours 3
@@ -60,6 +60,7 @@ REGION_NAMES = {
     "broughtons-discovery": "Broughtons & Discovery", "northern-georgia-strait": "Northern Georgia Strait",
     "san-juan-gulf-islands": "San Juan & Gulf Islands", "puget-sound": "Puget Sound",
     "overview": "Whole extent (overview)", "coast-overview": "Whole coast (overview)",
+    "pnw-rockies": "PNW & Rockies (overview)",
 }
 
 # Whole-extent zoomed-out layers. The six regions above do NOT tile these extents: central Juan
@@ -72,6 +73,7 @@ REGION_NAMES = {
 OVERVIEWS = {
     "overview":       [-129.0, 46.9, -122.0, 52.13],
     "coast-overview": [-133.6, 46.9, -122.0, 54.5],
+    "pnw-rockies":    [-128.0, 42.0, -104.0, 52.0],
 }
 OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
 
@@ -287,8 +289,8 @@ def main():
 
     # Overviews MUST come last: hrdps_summary.html picks the first region whose bbox contains the
     # point, and the overview bboxes contain them all -- ahead of them they would shadow every
-    # region. Within the overviews, "overview" stays ahead of "coast-overview" (same rule: the
-    # coast bbox contains the unified-map bbox).
+    # region. Within the overviews, dict insertion order keeps them narrow→wide:
+    # overview → coast-overview → pnw-rockies.
     mkeys = [k for k in keys if k not in OVERVIEWS] + [k for k in OVERVIEWS if k in keys]
     manifest = {
         "model": M["name"], "run": run_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
