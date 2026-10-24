@@ -77,6 +77,11 @@ OVERVIEWS = {
 }
 OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
 
+# Gusts (inReach text forecasts, inreach_bot.py). Baked to a SEPARATE {k}.gust.bin so the map's
+# {k}.bin layout and size check are untouched. One byte per cell per hour, km/h, 255 = nodata,
+# hours aligned 1:1 with manifest["hours"]. coast-overview covers every paddling region.
+GUST_REGIONS = ["coast-overview"]
+
 def overview_res():
     """Overview cell size: never finer than OVERVIEW_RES, so the 1 km nest is downsampled here
     (at native 1 km this extent would be ~43 MB/run) while the 2.5 km model passes through."""
@@ -130,6 +135,22 @@ def run_datetime(sample_filename):
     # date+run token "YYYYMMDDTHHZ" appears at the start (continental) or mid-name (west)
     m = re.search(r"(\d{8})T(\d{2})Z", sample_filename)
     return dt.datetime.strptime(m.group(1), "%Y%m%d").replace(hour=int(m.group(2)), tzinfo=dt.timezone.utc)
+
+def find_gust_label(run_base, run_hh):
+    """Discover the gust GRIB2 label (e.g. 'GUST_AGL-10m') from a run's hour listing, so a Datamart
+    renaming doesn't silently break it. Returns None if the run publishes no gust field."""
+    for hhh in (1, 3, 6):
+        try:
+            files = [f for f in list_links(f"{run_base}/{run_hh}/{hhh:03d}/")
+                     if "GUST" in f and f.endswith(".grib2")]
+        except Exception:
+            continue
+        files.sort(key=lambda f: ("10m" not in f and "10" not in f, len(f)))   # prefer 10 m gust
+        for f in files:
+            m = re.search(r"(GUST[A-Z]*_[A-Za-z0-9.-]+)", f)
+            if m:
+                return m.group(1)
+    return None
 
 def file_for(sample, label, hhh):
     f = sample.replace(M["wind_label"], label)              # sample is the WIND file
@@ -262,6 +283,13 @@ def main():
     interps = {}
     buffers = {k: bytearray() for k in keys}
     times = []
+    gkeys = [k for k in keys if k in GUST_REGIONS]
+    gust_label = find_gust_label(run_base, run_hh) if gkeys else None
+    if gkeys:
+        log(f"  gust label: {gust_label or 'NOT FOUND (no gust bake this run)'}")
+    if not gust_label:
+        gkeys = []
+    gbuffers = {k: bytearray() for k in gkeys}
 
     for hhh in hours:
         base = f"{run_base}/{run_hh}/{hhh:03d}/"
@@ -281,6 +309,21 @@ def main():
 
         for k in keys:
             buffers[k] += pack(regrid(wvals * 3.6, interps[k]), regrid(dvals, interps[k]))
+        if gkeys:
+            # Hour 000 has no gust (it's a max over the preceding period): write nodata so the
+            # gust file stays aligned 1:1 with manifest hours.
+            gvals = None
+            try:
+                gvals, _, _ = read_grib(http_get(base + file_for(sample, gust_label, hhh), binary=True))
+            except Exception as e:
+                log(f"  hour {hhh:03d}: gust missing ({e})")
+            for k in gkeys:
+                n = interps[k]["cols"] * interps[k]["rows"]
+                if gvals is None:
+                    gbuffers[k] += bytes([255]) * n
+                else:
+                    g = regrid(gvals * 3.6, interps[k])
+                    gbuffers[k] += np.where(np.isnan(g), 255, np.clip(np.round(g), 0, 254)).astype("uint8").tobytes()
         times.append((run_dt + dt.timedelta(hours=hhh)).strftime("%Y-%m-%dT%H:%M:%SZ"))
         log(f"  hour {hhh:03d}: ok")
 
@@ -300,11 +343,15 @@ def main():
                         "cols": interps[k]["cols"], "rows": interps[k]["rows"],
                         "res_deg": res_of(k), "file": f"{k}.bin"} for k in mkeys},
     }
+    if gkeys:
+        manifest["gust"] = {"label": gust_label, "units": "km/h", "nodata": 255,
+                            "regions": {k: f"{k}.gust.bin" for k in gkeys}}
 
     if args.no_upload:
         os.makedirs("out", exist_ok=True)
         json.dump(manifest, open("out/manifest.json", "w"), indent=2)
         for k in keys: open(f"out/{k}.bin", "wb").write(bytes(buffers[k]))
+        for k in gkeys: open(f"out/{k}.gust.bin", "wb").write(bytes(gbuffers[k]))
         log(f"Wrote ./out for model {args.model}")
         for k in keys:
             n = interps[k]["cols"] * interps[k]["rows"]
@@ -319,6 +366,8 @@ def main():
         r2_put(c, "manifest.json", json.dumps(manifest).encode(), "application/json")
         for k in keys:
             r2_put(c, f"{k}.bin", bytes(buffers[k]), "application/octet-stream")
+        for k in gkeys:
+            r2_put(c, f"{k}.gust.bin", bytes(gbuffers[k]), "application/octet-stream")
         log(f"Uploaded manifest + {len(keys)} region files to R2 ({M['prefix']}/)")
         # Archive is unconditional on upload runs (invariant 6); an archive failure
         # must fail the job so GitHub alerts. Stitched best-lead runs for continental
