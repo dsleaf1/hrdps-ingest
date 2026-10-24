@@ -14,8 +14,7 @@ REPLY (one message, <= 160 chars):
     - first line: the point the forecast is for, then the HRDPS run (UTC) it came from
     - each day: weekday + date, then always five slots, local time 06 09 12 15 18
     - SE15G25 = wind FROM the SE at 15 kt, gusting 25 kt;  C = calm (< 3 kt)
-    - today is skipped once it is past 06:00 local; the last day may end in "-" for slots beyond
-      the run's 48 h (positions stay fixed), so 1-2 days depending on request time and run
+    - "-" = a slot already past (today) or beyond the run's 48 h (last day); positions stay fixed
 
 DATA: reads the same Cloudflare R2 files the Salish marine map reads (hrdps/manifest.json +
 coast-overview.bin), plus coast-overview.gust.bin baked by ingest.py. Nearest 2.5 km cell.
@@ -125,17 +124,19 @@ def build_reply(fc, lat, lon, now=None):
         W, S, E, N = fc.bbox
         return [f"{lat:.2f},{lon:.2f} is outside the forecast area ({S:.0f}-{N:.0f}N {-E:.0f}-{-W:.0f}W)"]
     now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(LOCAL_TZ)
-    day = now.date() if now.hour < SLOTS[0] else now.date() + dt.timedelta(days=1)
+    # Start today unless today's last slot is already over; slots more than an hour gone show "-".
+    day = now.date() if now.hour <= SLOTS[-1] else now.date() + dt.timedelta(days=1)
+    cutoff = now - dt.timedelta(hours=1)
     lines = []
     while True:
         idx = []
         for h in SLOTS:
             t = dt.datetime(day.year, day.month, day.day, h, tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
-            idx.append(fc.hour_index.get(t))
+            idx.append(fc.hour_index.get(t) if t >= cutoff else None)
         if all(i is None for i in idx):
             break
-        # A day past the run's 48 h shows "-" for the slots it doesn't reach (keeps the
-        # 06/09/12/15/18 positions fixed). Today is never partial: it's skipped after 06:00.
+        # "-" marks a slot already past (today) or beyond the run's 48 h (last day), so the
+        # 06/09/12/15/18 positions stay fixed.
         codes = [slot_code(*fc.at(i, cell)) if i is not None else "-" for i in idx]
         lines.append(f"{DAYS[day.weekday()]}{day.day:02d} " + " ".join(codes))
         day += dt.timedelta(days=1)

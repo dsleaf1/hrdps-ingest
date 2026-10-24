@@ -93,7 +93,8 @@ Su25 NW8G12 NW10G14 - - -
 ```
 Line 1: the point and the HRDPS run (UTC). Then one line per day, always five slots in local
 time **06 09 12 15 18**. `SE15G25` = wind *from* SE 15 kt gusting 25 kt; `C` = calm (<3 kt);
-`-` = beyond the end of the 48 h run. Today is skipped once it is past 06:00 local.
+`-` = a slot already past (today) or beyond the end of the 48 h run. Today is shown from the
+current slot on; it is skipped only once 18:00 has passed.
 
 **Setup**
 1. Create a dedicated Gmail account for the bot, turn on 2-Step Verification, and create an
