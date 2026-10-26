@@ -51,6 +51,12 @@ HELP = "Send: wx LAT LON  e.g. wx 49.36 -125.72  (or just wx for your GPS spot)"
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
+def note(msg, level="notice"):
+    """Key events also become GitHub Actions annotations (visible on the run page)."""
+    log(msg)
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::{level}::" + msg.replace("%", "%25").replace("\r", "").replace("\n", "%0A"), flush=True)
+
 # ---------------------------------------------------------------- forecast data
 def fetch(url, timeout=120):
     req = urllib.request.Request(url, headers={"User-Agent": "inreach-wx-bot"})
@@ -233,7 +239,7 @@ def handle(msg, fc_loader, allowed):
     if allowed:
         hay = " ".join([msg.get("From", ""), msg.get("Reply-To", ""), text]).lower()
         if not any(a in hay for a in allowed):
-            log(f"  ignored: sender not allowed ({sender})")
+            note(f"ignored: sender not allowed ({sender})")
             return None, link, sender
     req = parse_request(text)
     if req is None:
@@ -276,16 +282,16 @@ def main():
     im.select("INBOX")
     _, data = im.search(None, "UNSEEN")
     ids = data[0].split()
-    log(f"{len(ids)} unread")
+    note(f"Gmail login ok as {user}: {len(ids)} unread")
     failures = 0
     for mid in ids:
         _, d = im.fetch(mid, "(BODY.PEEK[])")
         msg = email.message_from_bytes(d[0][1])
-        log(f"- {msg.get('From')} | {msg.get('Subject')}")
+        note(f"from {msg.get('From')} | {msg.get('Subject')}")
         try:
             replies, link, sender = handle(msg, fc_loader, allowed)
             for body in replies or []:
-                log(f"  reply ({len(body)} ch): {body!r}")
+                note(f"{'DRY RUN would send' if args.dry_run else 'reply'} via {'Garmin' if link else 'email'} ({len(body)} ch):\n{body}")
                 if args.dry_run:
                     continue
                 if link:
@@ -294,7 +300,7 @@ def main():
                     send_email(sender, msg.get("Subject"), body, user, pw)
         except Exception as e:
             failures += 1
-            log(f"  FAILED: {e}")
+            note(f"FAILED: {e}", "error")
         if not args.dry_run:
             im.store(mid, "+FLAGS", "\\Seen")     # never retry: a retry loop would bill the user
     im.logout()
