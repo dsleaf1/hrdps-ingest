@@ -57,6 +57,26 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
         run: python ingest.py --model ${{ github.event.inputs.model }} --no-upload --max-hours 3 --regions haida-gwaii,coast-overview
 
+      - name: Report test result (as annotations)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
+        run: |
+          python - <<'PY'
+          import json, os
+          m = json.load(open("out/manifest.json"))
+          print(f"::notice title=run::{m['run']} hours={len(m['hours'])}")
+          g = m.get("gust")
+          if not g:
+              print("::warning title=gust::no gust in manifest (label not found on Datamart)")
+          else:
+              for k, f in g["regions"].items():
+                  b = open("out/" + f, "rb").read()
+                  n = m["regions"][k]["cols"] * m["regions"][k]["rows"]
+                  for h in range(len(m["hours"])):
+                      v = [x for x in b[h*n:(h+1)*n] if x != 255]
+                      s = f"{len(v)}/{n} valid, km/h max={max(v)} mean={sum(v)/len(v):.0f}" if v else "all nodata"
+                      print(f"::notice title=gust {g['label']} {k} h{h}::{s}")
+          PY
+
       - name: Upload test output
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
         uses: actions/upload-artifact@v4
