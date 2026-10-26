@@ -3,8 +3,6 @@ name: inReach wind bot
 # Checks the bot's Gmail inbox for "wx LAT LON" requests and replies with the HRDPS wind shorthand.
 # GitHub runs schedules on a best-effort basis: expect a reply within ~10-20 min of sending.
 on:
-  push:
-    branches: [inreach-bot]   # pre-merge testing: always a dry run (remove before merge)
   schedule:
     - cron: "*/10 * * * *"
   workflow_dispatch:
@@ -32,4 +30,4 @@ jobs:
           GMAIL_USER: ${{ secrets.INREACH_GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.INREACH_GMAIL_APP_PASSWORD }}
           ALLOWED_SENDERS: ${{ secrets.INREACH_ALLOWED_SENDERS }}
-        run: python inreach_bot.py ${{ (github.event_name == 'push' || github.event.inputs.dry_run == 'true') && '--dry-run' || '' }}
+        run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
