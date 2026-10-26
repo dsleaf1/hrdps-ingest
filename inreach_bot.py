@@ -267,7 +267,10 @@ def main():
         print("\n---\n".join(replies or ["(no reply)"]))
         return
 
-    user, pw = os.environ["GMAIL_USER"], os.environ["GMAIL_APP_PASSWORD"]
+    user, pw = os.environ.get("GMAIL_USER", ""), os.environ.get("GMAIL_APP_PASSWORD", "")
+    if not (user and pw):
+        log("GMAIL_USER / GMAIL_APP_PASSWORD not set: nothing to do (add the repo secrets to enable)")
+        return                                    # exit 0: no failure emails before setup
     im = imaplib.IMAP4_SSL("imap.gmail.com")
     im.login(user, pw)
     im.select("INBOX")

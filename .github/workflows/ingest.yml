@@ -55,7 +55,7 @@ jobs:
 
       - name: Test (decode only, no upload)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
-        run: python ingest.py --model ${{ github.event.inputs.model }} --no-upload --max-hours 3 --regions haida-gwaii
+        run: python ingest.py --model ${{ github.event.inputs.model }} --no-upload --max-hours 3 --regions haida-gwaii,coast-overview
 
       - name: Upload test output
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'test' }}
