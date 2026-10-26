@@ -75,3 +75,38 @@ pip install -r requirements.txt        # plus a system eccodes (e.g. brew instal
 python ingest.py --no-upload --regions haida-gwaii --max-hours 3
 # -> ./out/manifest.json + ./out/haida-gwaii.bin
 ```
+
+## inReach wind bot (`inreach_bot.py`, `.github/workflows/inreach.yml`)
+
+Text a position from a Garmin inReach, get back the HRDPS 2.5 km wind for that spot in one
+≤160-character message. Reads the same R2 bake as the map (`coast-overview`), plus the gust
+file `coast-overview.gust.bin` that `ingest.py` now writes alongside it.
+
+**Send** (to the bot's Gmail address): `wx 49.36 -125.72` — the minus is optional — or just
+`wx` to use the inReach's own GPS fix.
+
+**Reply:**
+```
+49.36,-125.72 18Z
+Sa24 SE12G20 SE15G25 S18G28 SW15G22 W10G15
+Su25 NW8G12 NW10G14 - - -
+```
+Line 1: the point and the HRDPS run (UTC). Then one line per day, always five slots in local
+time **06 09 12 15 18**. `SE15G25` = wind *from* SE 15 kt gusting 25 kt; `C` = calm (<3 kt);
+`-` = a slot already past (today) or beyond the end of the 48 h run. Today is shown from the
+current slot on; it is skipped only once 18:00 has passed.
+
+**Setup**
+1. Create a dedicated Gmail account for the bot, turn on 2-Step Verification, and create an
+   **App password** (Google Account → Security → App passwords).
+2. Repo **Settings → Secrets and variables → Actions**, add:
+   `INREACH_GMAIL_USER` (the address), `INREACH_GMAIL_APP_PASSWORD`, and optionally
+   `INREACH_ALLOWED_SENDERS` (comma list of words that must appear in the request email, e.g. each
+   paddler's inReach address or name) — leave unset to answer anyone.
+3. Add the bot's address as a contact on each inReach.
+4. Test: **Actions → inReach wind bot → Run workflow** with *dry run* ticked prints replies
+   without sending. Locally: `python inreach_bot.py --point 49.36 -125.72`.
+
+Replies to inReach requests go through the "send a reply" link in Garmin's email (delivered to the
+device); requests from an ordinary email address are answered by email. Every processed email is
+marked read even on failure, so a fault can never loop and run up a paddler's message bill.
