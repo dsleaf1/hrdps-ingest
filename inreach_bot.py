@@ -277,8 +277,12 @@ def main():
     if not (user and pw):
         log("GMAIL_USER / GMAIL_APP_PASSWORD not set: nothing to do (add the repo secrets to enable)")
         return                                    # exit 0: no failure emails before setup
-    im = imaplib.IMAP4_SSL("imap.gmail.com")
-    im.login(user, pw)
+    try:
+        im = imaplib.IMAP4_SSL("imap.gmail.com")
+        im.login(user, pw.replace(" ", ""))
+    except Exception as e:
+        note(f"Gmail login failed for {user!r} (password {len(pw.replace(' ', ''))} chars): {e}", "error")
+        sys.exit(1)
     im.select("INBOX")
     _, data = im.search(None, "UNSEEN")
     ids = data[0].split()
