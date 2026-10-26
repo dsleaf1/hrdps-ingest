@@ -275,7 +275,8 @@ def main():
 
     user, pw = os.environ.get("GMAIL_USER", ""), os.environ.get("GMAIL_APP_PASSWORD", "")
     if not (user and pw):
-        log("GMAIL_USER / GMAIL_APP_PASSWORD not set: nothing to do (add the repo secrets to enable)")
+        missing = [n for n, v in (("INREACH_GMAIL_USER", user), ("INREACH_GMAIL_APP_PASSWORD", pw)) if not v]
+        note("secret(s) empty or missing: " + ", ".join(missing) + " -- nothing to do", "warning")
         return                                    # exit 0: no failure emails before setup
     try:
         im = imaplib.IMAP4_SSL("imap.gmail.com")
