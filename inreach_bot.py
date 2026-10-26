@@ -30,7 +30,7 @@ Local checks (no mail needed):
     python inreach_bot.py --point 49.36 -125.72           # print the reply for a point
     python inreach_bot.py --eml sample.eml --dry-run      # parse a saved email, print the reply
 """
-import os, re, sys, json, gzip, email, imaplib, smtplib, random, argparse
+import os, re, sys, json, gzip, email, email.header, imaplib, smtplib, random, argparse
 import datetime as dt
 import urllib.request, urllib.parse, http.cookiejar
 from email.message import EmailMessage
@@ -160,7 +160,7 @@ def build_reply(fc, lat, lon, now=None):
     return msgs
 
 # ---------------------------------------------------------------- parsing requests
-CMD_RE = re.compile(r"(?i)(?<![a-z])wx\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?))?")
+CMD_RE = re.compile(r"(?i)(?<![a-z])wx\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
 GPS_RE = re.compile(r"(?i)\blat(?:itude)?[:\s]+(-?\d{1,2}\.\d+)[^\d-]+lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+)")
 LINK_RE = re.compile(r"https://[^\s\"'<>]*garmin\.com/textmessage/txtmsg\?[^\s\"'<>]*extId=[^\s\"'<>]+", re.I)
 
@@ -183,6 +183,7 @@ def parse_request(text):
     """-> (lat, lon) | 'gps-missing' | None (not a wx request)."""
     # Only the user's own message: Garmin appends the reply link and GPS line below it.
     head = re.split(r"(?i)view the location|send a reply|sent this message from", text)[0]
+    head = head.replace("\u2212", "-").replace("\u2013", "-").replace("\u00b0", "")  # phone/Mac auto-typography
     m = CMD_RE.search(head)
     if not m:
         return None
@@ -242,6 +243,11 @@ def handle(msg, fc_loader, allowed):
             note(f"ignored: sender not allowed ({sender})")
             return None, link, sender
     req = parse_request(text)
+    if req is None:                               # the command may be in the subject instead
+        subj = str(email.header.make_header(email.header.decode_header(msg.get("Subject", ""))))
+        req = parse_request(subj + "\n" + text)
+    if req is None and "google.com" not in sender:
+        note(f"not a wx request; body starts: {text.strip()[:80]!r}")
     if req is None:
         # Not a command. Answer with help only if it came from a device (costs them a message).
         return ([HELP] if link else None), link, sender
