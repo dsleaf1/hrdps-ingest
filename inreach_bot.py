@@ -281,7 +281,10 @@ def main():
         im = imaplib.IMAP4_SSL("imap.gmail.com")
         im.login(user, pw.replace(" ", ""))
     except Exception as e:
-        note(f"Gmail login failed for {user!r} (password {len(pw.replace(' ', ''))} chars): {e}", "error")
+        u = user.strip().lower()
+        note(f"Gmail login failed (address {len(user)} chars, matches hrdpsforecast@gmail.com: "
+             f"{u == 'hrdpsforecast@gmail.com'}, stray spaces: {user != user.strip()}; password "
+             f"{len(pw.replace(' ', ''))} chars, letters only: {pw.replace(' ', '').isalpha()}): {e}", "error")
         sys.exit(1)
     im.select("INBOX")
     _, data = im.search(None, "UNSEEN")
