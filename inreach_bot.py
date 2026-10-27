@@ -302,7 +302,7 @@ def inspect_latest(im):
     if not link:
         note("inspect: no reply link found", "warning"); return
     try:
-        _, final, page = open_reply_page(link)
+        op, final, page = open_reply_page(link)
         fu = urllib.parse.urlparse(final)
         note(f"inspect link -> {fu.scheme}://{fu.netloc}{fu.path} query keys {sorted(urllib.parse.parse_qs(fu.query))}")
         forms = re.findall(r"<form[^>]*>", page, re.I)
@@ -310,6 +310,22 @@ def inspect_latest(im):
         posts = sorted(set(re.findall(r"(?i)(?:url|action)\s*[:=]\s*['\"]([^'\"]*TxtMsg[^'\"]*)", page)))
         note(f"inspect reply page: {len(page)} B, forms {[mask(f) for f in forms][:5]}, fields {fields[:20]}, "
              f"post targets {[mask(x) for x in posts][:5]}, mentions ReplyMessage: {'ReplyMessage' in page}")
+        tok = link.rstrip("/").rsplit("/", 1)[-1] if "inreachlink.com" in link else ""
+        def m2(x):                                           # mask the private tokens by length
+            for t_ in filter(None, [tok] + urllib.parse.parse_qs(fu.query).get("extId", [])):
+                x = x.replace(t_, f"<tok{len(t_)}>")
+            return x
+        note("inspect /reply mentions: " + json.dumps([m2(c) for c in re.findall(r".{0,80}/reply/.{0,120}", page)][:6])[:1500])
+        note("inspect tinyUrlId ctx: " + json.dumps([m2(c) for c in re.findall(r".{0,100}tinyUrlId.{0,100}", page)][:6])[:1500])
+        note(f"inspect token in page: {tok and tok in page}; token length {len(tok)}")
+        for cand in ([f"https://messenger.garmin.com/web/reply/{tok}", f"https://messenger.garmin.com/reply/{tok}"] if tok else []):
+            try:
+                with op.open(cand, timeout=60) as r2:
+                    body2 = r2.read().decode("utf-8", "replace")
+                    note(f"inspect GET {m2(cand)} -> {r2.status} {m2(r2.geturl())} {len(body2)} B, "
+                         f"has sendReply page chunk: {'reply/%5BtinyUrlId%5D' in body2 or '(reply)' in body2}")
+            except Exception as e:
+                note(f"inspect GET {m2(cand)} -> {e}")
         if os.environ.get("INSPECT_JS"):
             base = f"{fu.scheme}://{fu.netloc}"
             srcs = re.findall(r'<script[^>]*src="([^"]+)"', page)
