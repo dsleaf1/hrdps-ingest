@@ -256,6 +256,7 @@ def send_garmin(link, body, reply_addr=None):
         raise RuntimeError(f"Garmin reply failed: HTTP {e.code} {e.read()[:200]!r}")
     if status != 200 or re.search(r'(^|\n)\w+:E\{', resp):
         raise RuntimeError(f"Garmin reply failed: HTTP {status} {resp[:200]!r}")
+    note(f"Garmin accepted reply: HTTP {status}, response {resp.replace(tok, '<tok>')[:300]!r}")
 
 def send_email(to, subject, body, user, pw):
     m = EmailMessage()
