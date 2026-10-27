@@ -1,0 +1,28 @@
+name: Debug fetch (public files -> debug branch)
+
+# One-off helper: download public URLs and commit them to the 'debug-fetch' branch so they can be
+# read from a sandbox that can't reach the site. Delete when no longer needed.
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: "Space-separated public URLs"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and push
+        env:
+          URLS: ${{ github.event.inputs.urls }}
+        run: |
+          git checkout --orphan debug-fetch && git rm -rfq . && mkdir -p fetched
+          i=0; for u in $URLS; do i=$((i+1)); curl -sSL -A "Mozilla/5.0" "$u" -o "fetched/$i.txt" || true; echo "$i $u" >> fetched/index.txt; done
+          git add fetched && git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm "debug fetch"
+          git push -qf origin debug-fetch
