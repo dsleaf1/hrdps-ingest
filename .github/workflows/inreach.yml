@@ -34,4 +34,5 @@ jobs:
           GMAIL_USER: ${{ secrets.INREACH_GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.INREACH_GMAIL_APP_PASSWORD }}
           ALLOWED_SENDERS: ${{ secrets.INREACH_ALLOWED_SENDERS }}
+          INSPECT_JS: ${{ github.event.inputs.inspect == 'true' && '1' || '' }}
         run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} ${{ github.event.inputs.inspect == 'true' && '--inspect' || '' }}

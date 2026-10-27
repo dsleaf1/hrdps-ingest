@@ -217,6 +217,11 @@ def open_reply_page(link):
     with op.open(link, timeout=60) as r:
         return op, r.geturl(), r.read().decode("utf-8", "replace")
 
+def op_get(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (inreach-wx-bot)"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode("utf-8", "replace")
+
 def send_garmin(link, body, reply_addr):
     """Answer through the inReach web reply form, which delivers to the device."""
     op, link, page = open_reply_page(link)               # follows inreachlink.com -> explore.garmin.com
@@ -305,6 +310,23 @@ def inspect_latest(im):
         posts = sorted(set(re.findall(r"(?i)(?:url|action)\s*[:=]\s*['\"]([^'\"]*TxtMsg[^'\"]*)", page)))
         note(f"inspect reply page: {len(page)} B, forms {[mask(f) for f in forms][:5]}, fields {fields[:20]}, "
              f"post targets {[mask(x) for x in posts][:5]}, mentions ReplyMessage: {'ReplyMessage' in page}")
+        if os.environ.get("INSPECT_JS"):
+            base = f"{fu.scheme}://{fu.netloc}"
+            srcs = re.findall(r'<script[^>]*src="([^"]+)"', page)
+            note(f"inspect scripts: {srcs[:25]}")
+            hits = set()
+            for src in srcs:
+                url = src if src.startswith("http") else base + ("" if src.startswith("/") else "/") + src
+                try:
+                    js = op_get(url)
+                except Exception as e:
+                    note(f"inspect js {src}: {e}"); continue
+                for m in re.finditer(r"""["'`]((?:https?://[a-z0-9.-]*garmin[a-z0-9.-]*)?/[A-Za-z0-9_./{}$-]*(?:api|reply|message|msg|extId|inbound|conversation)[A-Za-z0-9_./{}$?=&-]*)["'`]""", js, re.I):
+                    hits.add(m.group(1))
+                for m in re.finditer(r".{0,90}extId.{0,140}", js):
+                    hits.add("CTX: " + m.group(0))
+            for chunk in range(0, min(len(hits), 120), 12):
+                note("inspect js hits: " + json.dumps(sorted(hits)[chunk:chunk + 12])[:1800])
     except Exception as e:
         note(f"inspect: opening reply link failed: {e}", "warning")
 
