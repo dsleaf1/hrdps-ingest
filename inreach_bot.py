@@ -313,6 +313,8 @@ def inspect_latest(im):
         if os.environ.get("INSPECT_JS"):
             base = f"{fu.scheme}://{fu.netloc}"
             srcs = re.findall(r'<script[^>]*src="([^"]+)"', page)
+            srcs += ["/web/_next/" + x for x in re.findall(r'(static/chunks/app/[^"\\]+?\.js)', page)]
+            srcs = list(dict.fromkeys(srcs))
             note(f"inspect scripts: {srcs[:25]}")
             hits = set()
             for src in srcs:
@@ -323,8 +325,11 @@ def inspect_latest(im):
                     note(f"inspect js {src}: {e}"); continue
                 for m in re.finditer(r"""["'`]((?:https?://[a-z0-9.-]*garmin[a-z0-9.-]*)?/[A-Za-z0-9_./{}$-]*(?:api|reply|message|msg|extId|inbound|conversation)[A-Za-z0-9_./{}$?=&-]*)["'`]""", js, re.I):
                     hits.add(m.group(1))
-                for m in re.finditer(r".{0,90}extId.{0,140}", js):
-                    hits.add("CTX: " + m.group(0))
+                if "/reply" in js or "extId" in js:
+                    note(f"inspect js file with reply/extId: {src}")
+                for m in re.finditer(r".{0,160}(?:\"/reply\"|/reply/|extId|ReplyMessage|replyMessage).{0,260}", js):
+                    if "parentId" not in m.group(0):
+                        hits.add("CTX: " + m.group(0))
             for chunk in range(0, min(len(hits), 120), 12):
                 note("inspect js hits: " + json.dumps(sorted(hits)[chunk:chunk + 12])[:1800])
     except Exception as e:
