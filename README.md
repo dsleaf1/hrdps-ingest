@@ -110,3 +110,18 @@ current slot on; it is skipped only once 18:00 has passed.
 Replies to inReach requests go through the "send a reply" link in Garmin's email (delivered to the
 device); requests from an ordinary email address are answered by email. Every processed email is
 marked read even on failure, so a fault can never loop and run up a paddler's message bill.
+
+### Fast trigger (Google Apps Script)
+
+GitHub runs frequent schedules late (hours, on free accounts), so `apps_script/dispatch.gs` runs
+inside the bot's Gmail every minute and starts the bot workflow as soon as a new unread email
+arrives. Replies then go out within ~2 minutes; the inReach still has to check in to receive them.
+
+1. GitHub → Settings → Developer settings → Fine-grained tokens → **Generate new token**:
+   repository access *Only select repositories* → `hrdps-ingest`; permissions → **Actions: Read and
+   write**. Copy the token.
+2. Signed in as the bot account, open https://script.google.com → **New project**, paste
+   `dispatch.gs` over the sample code, save.
+3. Project Settings (gear) → **Script Properties** → add `GITHUB_TOKEN` = the token.
+4. Back in the editor, choose the function **install** → **Run**, and approve the permissions
+   (Gmail read, external requests). That creates the every-minute trigger.
