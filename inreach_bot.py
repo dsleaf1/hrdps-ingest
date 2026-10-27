@@ -255,11 +255,43 @@ def handle(msg, fc_loader, allowed):
         return [HELP], link, sender
     return build_reply(fc_loader(), *req), link, sender
 
+def mask(t):
+    """Hide location digits and private IDs/tokens so the dump is safe in a public run log."""
+    t = re.sub(r"(?i)(lat(?:itude)?|lon(?:gitude)?)([:\s]+)-?\d+(?:\.\d+)?", r"\1\2<num>", t)
+    t = re.sub(r"(https?://[^/\s]+/)[^\s\"'<>]*", lambda m: m.group(1) + "<path:" + str(len(m.group(0))) + ">", t)
+    t = re.sub(r"[A-Za-z0-9._%+-]+@", "<user>@", t)
+    t = re.sub(r"-?\d{1,3}\.\d{3,}", "<num>", t)                  # bare high-precision coords
+    return t
+
+def inspect_latest(im):
+    _, data = im.search(None, '(FROM "inreach")')
+    ids = data[0].split()
+    if not ids:
+        note("inspect: no inReach email found"); return
+    _, d = im.fetch(ids[-1], "(BODY.PEEK[])")
+    msg = email.message_from_bytes(d[0][1])
+    hdr = {h: mask(str(msg.get(h, ""))) for h in ("From", "Reply-To", "Sender", "To", "Subject")}
+    note("inspect headers: " + json.dumps(hdr))
+    for p in (msg.walk() if msg.is_multipart() else [msg]):
+        ct = p.get_content_type()
+        if ct.startswith("multipart/"):
+            continue
+        raw = (p.get_payload(decode=True) or b"").decode(p.get_content_charset() or "utf-8", "replace")
+        if ct == "text/html":
+            raw = re.sub(r"<(style|script)[^>]*>.*?</\1>", " ", raw, flags=re.S | re.I)
+            links = re.findall(r'href="([^"]+)"', raw)
+            note("inspect html links: " + json.dumps([mask(l) for l in links])[:900])
+            raw = re.sub(r"<[^>]+>", " ", raw)
+            raw = re.sub(r"[ \t]+", " ", raw)
+        note(f"inspect part {ct}: " + repr(mask(raw.strip()))[:1500])
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"))
     ap.add_argument("--eml", help="process one saved .eml file instead of the inbox")
     ap.add_argument("--dry-run", action="store_true", help="print replies, send nothing, mark nothing read")
+    ap.add_argument("--inspect", action="store_true",
+                    help="print the structure of the latest inReach email (location/IDs masked), then stop")
     args = ap.parse_args()
 
     fc_cache = {}
@@ -294,6 +326,8 @@ def main():
              f"{len(pw.replace(' ', ''))} chars, letters only: {pw.replace(' ', '').isalpha()}): {e}", "error")
         sys.exit(1)
     im.select("INBOX")
+    if args.inspect:
+        inspect_latest(im); im.logout(); return
     _, data = im.search(None, "UNSEEN")
     ids = data[0].split()
     note(f"Gmail login ok as {user}: {len(ids)} unread")
@@ -301,11 +335,12 @@ def main():
     for mid in ids:
         _, d = im.fetch(mid, "(BODY.PEEK[])")
         msg = email.message_from_bytes(d[0][1])
-        note(f"from {msg.get('From')} | {msg.get('Subject')}")
+        note(f"request from {'inReach' if 'inreach' in (msg.get('From') or '').lower() else 'email'}")
         try:
             replies, link, sender = handle(msg, fc_loader, allowed)
             for body in replies or []:
-                note(f"{'DRY RUN would send' if args.dry_run else 'reply'} via {'Garmin' if link else 'email'} ({len(body)} ch):\n{body}")
+                note(f"{'DRY RUN would send' if args.dry_run else 'reply'} via {'Garmin link' if link else 'email'} "
+                     f"({len(body)} ch):\n" + body.split("\n", 1)[-1])     # forecast only, no position
                 if args.dry_run:
                     continue
                 if link:

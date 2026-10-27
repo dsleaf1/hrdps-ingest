@@ -11,6 +11,10 @@ on:
         description: "Print replies without sending or marking mail read"
         type: boolean
         default: false
+      inspect:
+        description: "Show the structure of the latest inReach email (masked), reply to nothing"
+        type: boolean
+        default: false
 
 concurrency:
   group: inreach-bot          # never two pollers at once (would double-reply and double-bill)
@@ -30,4 +34,4 @@ jobs:
           GMAIL_USER: ${{ secrets.INREACH_GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.INREACH_GMAIL_APP_PASSWORD }}
           ALLOWED_SENDERS: ${{ secrets.INREACH_ALLOWED_SENDERS }}
-        run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }}
+        run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} ${{ github.event.inputs.inspect == 'true' && '--inspect' || '' }}
