@@ -162,7 +162,8 @@ def build_reply(fc, lat, lon, now=None):
 # ---------------------------------------------------------------- parsing requests
 CMD_RE = re.compile(r"(?i)(?<![a-z])wx\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
 GPS_RE = re.compile(r"(?i)\blat(?:itude)?[:\s]+(-?\d{1,2}\.\d+)[^\d-]+lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+)")
-LINK_RE = re.compile(r"https://[^\s\"'<>]*garmin\.com/textmessage/txtmsg\?[^\s\"'<>]*extId=[^\s\"'<>]+", re.I)
+LINK_RE = re.compile(r"https://(?:inreachlink\.com/[A-Za-z0-9_-]+|[^\s\"'<>]*garmin\.com/textmessage/txtmsg\?"
+                     r"[^\s\"'<>]*extId=[^\s\"'<>]+)", re.I)
 
 def message_text(msg):
     """Plain text of an email (falls back to de-tagged HTML)."""
@@ -184,11 +185,14 @@ def parse_request(text):
     # Only the user's own message: Garmin appends the reply link and GPS line below it.
     head = re.split(r"(?i)view the location|send a reply|sent this message from", text)[0]
     head = head.replace("\u2212", "-").replace("\u2013", "-").replace("\u00b0", "")  # phone/Mac auto-typography
+    head = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", head)            # inReach keyboard: "49. 36" -> "49.36"
     m = CMD_RE.search(head)
     if not m:
         return None
     if m.group(1):
         lat, lon = float(m.group(1)), float(m.group(2))
+    elif re.search(r"\d", head[m.end():m.end() + 30]):
+        return "gps-missing"                      # numbers typed but unreadable: ask, don't guess
     else:
         g = GPS_RE.search(text)
         if not g:
@@ -205,14 +209,19 @@ def reply_link(text):
     return m.group(0).replace("&amp;", "&") if m else None
 
 # ---------------------------------------------------------------- sending
-def send_garmin(link, body, reply_addr):
-    """Answer through the inReach web reply form, which delivers to the device."""
-    u = urllib.parse.urlparse(link)
-    ext_id = urllib.parse.parse_qs(u.query)["extId"][0]
+def open_reply_page(link):
+    """Open the reply page like a browser (cookies, redirects). -> (opener, final_url, html)"""
     jar = http.cookiejar.CookieJar()
     op = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     op.addheaders = [("User-Agent", "Mozilla/5.0 (inreach-wx-bot)")]
-    op.open(link, timeout=60).read()                      # session cookie, as a browser would
+    with op.open(link, timeout=60) as r:
+        return op, r.geturl(), r.read().decode("utf-8", "replace")
+
+def send_garmin(link, body, reply_addr):
+    """Answer through the inReach web reply form, which delivers to the device."""
+    op, link, page = open_reply_page(link)               # follows inreachlink.com -> explore.garmin.com
+    u = urllib.parse.urlparse(link)
+    ext_id = urllib.parse.parse_qs(u.query)["extId"][0]
     data = urllib.parse.urlencode({"ReplyAddress": reply_addr, "ReplyMessage": body,
                                    "MessageId": str(random.randint(10_000_000, 99_999_999)),
                                    "Guid": ext_id}).encode()
@@ -284,6 +293,20 @@ def inspect_latest(im):
             raw = re.sub(r"<[^>]+>", " ", raw)
             raw = re.sub(r"[ \t]+", " ", raw)
         note(f"inspect part {ct}: " + repr(mask(raw.strip()))[:1500])
+    link = reply_link(message_text(msg))
+    if not link:
+        note("inspect: no reply link found", "warning"); return
+    try:
+        _, final, page = open_reply_page(link)
+        fu = urllib.parse.urlparse(final)
+        note(f"inspect link -> {fu.scheme}://{fu.netloc}{fu.path} query keys {sorted(urllib.parse.parse_qs(fu.query))}")
+        forms = re.findall(r"<form[^>]*>", page, re.I)
+        fields = sorted(set(re.findall(r'<(?:input|textarea)[^>]*name="([^"]+)"', page, re.I)))
+        posts = sorted(set(re.findall(r"(?i)(?:url|action)\s*[:=]\s*['\"]([^'\"]*TxtMsg[^'\"]*)", page)))
+        note(f"inspect reply page: {len(page)} B, forms {[mask(f) for f in forms][:5]}, fields {fields[:20]}, "
+             f"post targets {[mask(x) for x in posts][:5]}, mentions ReplyMessage: {'ReplyMessage' in page}")
+    except Exception as e:
+        note(f"inspect: opening reply link failed: {e}", "warning")
 
 def main():
     ap = argparse.ArgumentParser()
@@ -345,6 +368,8 @@ def main():
                     continue
                 if link:
                     send_garmin(link, body, user)
+                elif "garmin.com" in sender.lower() or "inreach" in sender.lower():
+                    note("inReach email without a reply link: cannot reply", "error")
                 elif sender:
                     send_email(sender, msg.get("Subject"), body, user, pw)
         except Exception as e:
