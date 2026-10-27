@@ -19,8 +19,9 @@ REPLY (one message, <= 160 chars):
 DATA: reads the same Cloudflare R2 files the Salish marine map reads (hrdps/manifest.json +
 coast-overview.bin), plus coast-overview.gust.bin baked by ingest.py. Nearest 2.5 km cell.
 
-REPLY ROUTE: inReach emails carry a "send a reply" link (explore.garmin.com/textmessage/txtmsg?
-extId=...). The bot answers through that link, which delivers to the device. Requests from an
+REPLY ROUTE: inReach emails carry a reply link (inreachlink.com/<id> -> messenger.garmin.com/web/
+reply/<id>). The bot answers through that page, which delivers to the device. Garmin bounces plain
+email replies, so an inReach email without a link is logged as an error, never emailed. Requests from an
 ordinary email address (handy for testing) are answered by email instead.
 
 Env: GMAIL_USER, GMAIL_APP_PASSWORD, optional R2_PUBLIC (public bucket URL), optional
@@ -30,9 +31,9 @@ Local checks (no mail needed):
     python inreach_bot.py --point 49.36 -125.72           # print the reply for a point
     python inreach_bot.py --eml sample.eml --dry-run      # parse a saved email, print the reply
 """
-import os, re, sys, json, gzip, email, email.header, imaplib, smtplib, random, argparse
+import os, re, sys, json, gzip, email, email.header, imaplib, smtplib, argparse
 import datetime as dt
-import urllib.request, urllib.parse, http.cookiejar
+import urllib.request, urllib.parse, urllib.error, http.cookiejar
 from email.message import EmailMessage
 from email.utils import parseaddr
 from zoneinfo import ZoneInfo
@@ -217,26 +218,44 @@ def open_reply_page(link):
     with op.open(link, timeout=60) as r:
         return op, r.geturl(), r.read().decode("utf-8", "replace")
 
-def op_get(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (inreach-wx-bot)"})
-    with urllib.request.urlopen(req, timeout=60) as r:
-        return r.read().decode("utf-8", "replace")
+MESSENGER = "https://messenger.garmin.com"
 
-def send_garmin(link, body, reply_addr):
-    """Answer through the inReach web reply form, which delivers to the device."""
-    op, link, page = open_reply_page(link)               # follows inreachlink.com -> explore.garmin.com
-    u = urllib.parse.urlparse(link)
-    ext_id = urllib.parse.parse_qs(u.query)["extId"][0]
-    data = urllib.parse.urlencode({"ReplyAddress": reply_addr, "ReplyMessage": body,
-                                   "MessageId": str(random.randint(10_000_000, 99_999_999)),
-                                   "Guid": ext_id}).encode()
-    req = urllib.request.Request(f"{u.scheme}://{u.netloc}/TextMessage/TxtMsg", data=data,
-                                 headers={"Content-Type": "application/x-www-form-urlencoded",
-                                          "Referer": link})
-    with op.open(req, timeout=60) as r:
-        resp = r.read().decode("utf-8", "replace")
-    if r.status != 200 or "error" in resp.lower()[:200]:
-        raise RuntimeError(f"Garmin reply failed: HTTP {r.status} {resp[:200]}")
+def send_garmin(link, body, reply_addr=None):
+    """Reply through Garmin Messenger's web reply page (messenger.garmin.com/web/reply/<tinyUrlId>),
+    exactly as its Send button does: the Next.js server action sendReplyAction(tinyUrlId, text).
+    The action ID is read from Garmin's current page bundle each time, so a redeploy doesn't break it."""
+    op, final, page = open_reply_page(link)            # inreachlink.com -> messenger.garmin.com
+    m = re.search(r'tinyUrlId\\?"\s*:\s*\\?"([A-Za-z0-9_-]{6,})', page)
+    tok = m.group(1) if m else (link.rstrip("/").rsplit("/", 1)[-1] if "inreachlink.com" in link else None)
+    if not tok:
+        raise RuntimeError("reply page has no tinyUrlId")
+    page_url = f"{MESSENGER}/web/reply/{tok}"
+    if f"/web/reply/{tok}" not in final:
+        with op.open(page_url, timeout=60) as r:
+            page = r.read().decode("utf-8", "replace")
+    cm = re.search(r'static/chunks/app/\(reply\)/reply/%5BtinyUrlId%5D/page-[0-9a-f]+\.js', page)
+    if not cm:
+        raise RuntimeError("reply page bundle not found (Garmin changed the page?)")
+    with op.open(f"{MESSENGER}/web/_next/{cm.group(0)}", timeout=60) as r:
+        js = r.read().decode("utf-8", "replace")
+    am = re.search(r'createServerReference\)\("([0-9a-f]{20,})"[^;]{0,200}?"sendReplyAction"', js)
+    if not am:
+        raise RuntimeError("sendReplyAction not found in reply bundle (Garmin changed the page?)")
+    tree = ["", {"children": ["(reply)", {"children": ["reply", {"children": [["tinyUrlId", tok, "d"],
+            {"children": ["__PAGE__", {}, None, None]}, None, None]}, None, None]}, None, None]}, None, None, True]
+    req = urllib.request.Request(page_url, data=json.dumps([tok, body]).encode(), method="POST", headers={
+        "Next-Action": am.group(1),
+        "Next-Router-State-Tree": urllib.parse.quote(json.dumps(tree, separators=(",", ":"))),
+        "Accept": "text/x-component",
+        "Content-Type": "text/plain;charset=UTF-8",
+        "Origin": MESSENGER, "Referer": page_url})
+    try:
+        with op.open(req, timeout=60) as r:
+            status, resp = r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Garmin reply failed: HTTP {e.code} {e.read()[:200]!r}")
+    if status != 200 or re.search(r'(^|\n)\w+:E\{', resp):
+        raise RuntimeError(f"Garmin reply failed: HTTP {status} {resp[:200]!r}")
 
 def send_email(to, subject, body, user, pw):
     m = EmailMessage()
@@ -326,28 +345,6 @@ def inspect_latest(im):
                          f"has sendReply page chunk: {'reply/%5BtinyUrlId%5D' in body2 or '(reply)' in body2}")
             except Exception as e:
                 note(f"inspect GET {m2(cand)} -> {e}")
-        if os.environ.get("INSPECT_JS"):
-            base = f"{fu.scheme}://{fu.netloc}"
-            srcs = re.findall(r'<script[^>]*src="([^"]+)"', page)
-            srcs += ["/web/_next/" + x for x in re.findall(r'(static/chunks/app/[^"\\]+?\.js)', page)]
-            srcs = list(dict.fromkeys(srcs))
-            note(f"inspect scripts: {srcs[:25]}")
-            hits = set()
-            for src in srcs:
-                url = src if src.startswith("http") else base + ("" if src.startswith("/") else "/") + src
-                try:
-                    js = op_get(url)
-                except Exception as e:
-                    note(f"inspect js {src}: {e}"); continue
-                for m in re.finditer(r"""["'`]((?:https?://[a-z0-9.-]*garmin[a-z0-9.-]*)?/[A-Za-z0-9_./{}$-]*(?:api|reply|message|msg|extId|inbound|conversation)[A-Za-z0-9_./{}$?=&-]*)["'`]""", js, re.I):
-                    hits.add(m.group(1))
-                if "/reply" in js or "extId" in js:
-                    note(f"inspect js file with reply/extId: {src}")
-                for m in re.finditer(r".{0,160}(?:\"/reply\"|/reply/|extId|ReplyMessage|replyMessage).{0,260}", js):
-                    if "parentId" not in m.group(0):
-                        hits.add("CTX: " + m.group(0))
-            for chunk in range(0, min(len(hits), 120), 12):
-                note("inspect js hits: " + json.dumps(sorted(hits)[chunk:chunk + 12])[:1800])
     except Exception as e:
         note(f"inspect: opening reply link failed: {e}", "warning")
 
@@ -358,6 +355,8 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print replies, send nothing, mark nothing read")
     ap.add_argument("--inspect", action="store_true",
                     help="print the structure of the latest inReach email (location/IDs masked), then stop")
+    ap.add_argument("--answer-latest", action="store_true",
+                    help="(re)answer the most recent inReach request even if already read")
     args = ap.parse_args()
 
     fc_cache = {}
@@ -394,8 +393,12 @@ def main():
     im.select("INBOX")
     if args.inspect:
         inspect_latest(im); im.logout(); return
-    _, data = im.search(None, "UNSEEN")
-    ids = data[0].split()
+    if args.answer_latest:
+        _, data = im.search(None, '(FROM "inreach" SUBJECT "inReach message from")')
+        ids = data[0].split()[-1:]
+    else:
+        _, data = im.search(None, "UNSEEN")
+        ids = data[0].split()
     note(f"Gmail login ok as {user}: {len(ids)} unread")
     failures = 0
     for mid in ids:

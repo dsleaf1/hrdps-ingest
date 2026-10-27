@@ -11,6 +11,10 @@ on:
         description: "Print replies without sending or marking mail read"
         type: boolean
         default: false
+      answer_latest:
+        description: "Re-answer the most recent inReach request (even if already read)"
+        type: boolean
+        default: false
       inspect:
         description: "Show the structure of the latest inReach email (masked), reply to nothing"
         type: boolean
@@ -34,5 +38,4 @@ jobs:
           GMAIL_USER: ${{ secrets.INREACH_GMAIL_USER }}
           GMAIL_APP_PASSWORD: ${{ secrets.INREACH_GMAIL_APP_PASSWORD }}
           ALLOWED_SENDERS: ${{ secrets.INREACH_ALLOWED_SENDERS }}
-          INSPECT_JS: ''
-        run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} ${{ github.event.inputs.inspect == 'true' && '--inspect' || '' }}
+        run: python inreach_bot.py ${{ github.event.inputs.dry_run == 'true' && '--dry-run' || '' }} ${{ github.event.inputs.inspect == 'true' && '--inspect' || '' }} ${{ github.event.inputs.answer_latest == 'true' && '--answer-latest' || '' }}
