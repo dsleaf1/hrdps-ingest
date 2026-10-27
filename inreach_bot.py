@@ -264,7 +264,7 @@ def mask(t):
     return t
 
 def inspect_latest(im):
-    _, data = im.search(None, '(FROM "inreach")')
+    _, data = im.search(None, '(FROM "inreach" SUBJECT "inReach message from")')
     ids = data[0].split()
     if not ids:
         note("inspect: no inReach email found"); return
