@@ -39,8 +39,21 @@ from email.utils import parseaddr
 from zoneinfo import ZoneInfo
 
 R2_PUBLIC = os.environ.get("R2_PUBLIC", "https://pub-cb8eb71f75d64a57a0d021318ccd0ae7.r2.dev")
-REGION = "coast-overview"                 # Puget Sound -> Dixon Entrance incl. Haida Gwaii
+# Searched in order; the first whose box holds the point is used. Together: Port Townsend -> Skagway.
+REGIONS = ["coast-overview",              # Puget Sound -> Dixon Entrance incl. Haida Gwaii (to 54.5 N)
+           "north-passage"]               # Prince Rupert -> Skagway, Sitka, Glacier Bay (54.4-59.6 N)
+AREA_TEXT = "Puget Sd to Skagway, 47-59.6N"
 LOCAL_TZ = ZoneInfo("America/Vancouver")
+ALASKA_TZ = ZoneInfo("America/Juneau")
+
+def local_tz(lat, lon):
+    """Alaska time for the panhandle, Pacific elsewhere. The BC-Alaska border is approximated by a
+    line from Dixon Entrance / Portland Canal (56 N, 130.0 W) to White Pass (59.5 N, 135.1 W); it
+    is off by tens of km inland but every Inside Passage water lands on the right side."""
+    if lat < 54.65:
+        return LOCAL_TZ
+    border = -130.0 if lat < 56 else -130.0 - (lat - 56) * (5.1 / 3.5)
+    return ALASKA_TZ if lon < border else LOCAL_TZ
 SLOTS = (6, 9, 12, 15, 18)                # local hours, in reply order
 CALM_KT = 3
 MAX_LEN = 160
@@ -65,11 +78,29 @@ def fetch(url, timeout=120):
         b = r.read()
     return gzip.decompress(b) if b[:2] == b"\x1f\x8b" else b
 
-class Forecast:
-    """The latest HRDPS bake for one region, loaded once per bot run."""
+class Forecasts:
+    """The latest HRDPS bake: manifest read once, each region's files fetched on first use."""
     def __init__(self, base=R2_PUBLIC, loader=fetch):
+        self.base, self.loader, self.cache = base, loader, {}
         self.man = json.loads(loader(f"{base}/hrdps/manifest.json"))
-        reg = self.man["regions"][REGION]
+
+    def for_point(self, lat, lon):
+        for k in REGIONS:
+            reg = self.man["regions"].get(k)
+            if not reg:
+                continue
+            W, S, E, N = reg["bbox"]
+            if W <= lon <= E and S <= lat <= N:
+                if k not in self.cache:
+                    self.cache[k] = Forecast(self.man, k, self.base, self.loader)
+                return self.cache[k]
+        return None
+
+class Forecast:
+    """One region of the latest HRDPS bake."""
+    def __init__(self, man, region, base=R2_PUBLIC, loader=fetch):
+        self.man = man
+        reg = self.man["regions"][region]
         self.bbox, self.cols, self.rows = reg["bbox"], reg["cols"], reg["rows"]
         self.span = self.cols * self.rows
         self.wind = loader(f"{base}/hrdps/{reg['file']}")
@@ -77,7 +108,7 @@ class Forecast:
         if len(self.wind) != nh * 2 * self.span:
             raise RuntimeError(f"wind file is {len(self.wind)} B, expected {nh * 2 * self.span}")
         self.gust = None
-        gfile = self.man.get("gust", {}).get("regions", {}).get(REGION)
+        gfile = self.man.get("gust", {}).get("regions", {}).get(region)
         if gfile:
             try:
                 g = loader(f"{base}/hrdps/{gfile}")
@@ -124,13 +155,14 @@ def slot_code(kt, deg, gust):
         code += f"G{max(round(gust), k)}"
     return code
 
-def build_reply(fc, lat, lon, now=None):
-    """Return a list of message strings (normally one)."""
-    cell = fc.cell(lat, lon)
+def build_reply(fcs, lat, lon, now=None):
+    """Return a list of message strings (normally one). fcs: Forecasts (or a single Forecast)."""
+    fc = fcs.for_point(lat, lon) if isinstance(fcs, Forecasts) else fcs
+    cell = fc.cell(lat, lon) if fc else None
     if cell is None:
-        W, S, E, N = fc.bbox
-        return [f"{lat:.2f},{lon:.2f} is outside the forecast area ({S:.0f}-{N:.0f}N {-E:.0f}-{-W:.0f}W)"]
-    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(LOCAL_TZ)
+        return [f"{lat:.2f},{lon:.2f} is outside the forecast area ({AREA_TEXT})"]
+    tz = local_tz(lat, lon)
+    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(tz)
     # Start today unless today's last slot is already over; slots more than an hour gone show "-".
     day = now.date() if now.hour <= SLOTS[-1] else now.date() + dt.timedelta(days=1)
     cutoff = now - dt.timedelta(hours=1)
@@ -138,7 +170,7 @@ def build_reply(fc, lat, lon, now=None):
     while True:
         idx = []
         for h in SLOTS:
-            t = dt.datetime(day.year, day.month, day.day, h, tzinfo=LOCAL_TZ).astimezone(dt.timezone.utc)
+            t = dt.datetime(day.year, day.month, day.day, h, tzinfo=tz).astimezone(dt.timezone.utc)
             idx.append(fc.hour_index.get(t) if t >= cutoff else None)
         if all(i is None for i in idx):
             break
@@ -363,7 +395,7 @@ def main():
     fc_cache = {}
     def fc_loader():
         if "fc" not in fc_cache:
-            fc_cache["fc"] = Forecast()
+            fc_cache["fc"] = Forecasts()
         return fc_cache["fc"]
 
     if args.point:

@@ -79,8 +79,10 @@ python ingest.py --no-upload --regions haida-gwaii --max-hours 3
 ## inReach wind bot (`inreach_bot.py`, `.github/workflows/inreach.yml`)
 
 Text a position from a Garmin inReach, get back the HRDPS 2.5 km wind for that spot in one
-≤160-character message. Reads the same R2 bake as the map (`coast-overview`), plus the gust
-file `coast-overview.gust.bin` that `ingest.py` now writes alongside it.
+≤160-character message. Coverage is Port Townsend → Skagway: the map's `coast-overview` bake
+(to 54.5 N) plus `north-passage` (Prince Rupert → Skagway, Sitka, Glacier Bay), each with a gust
+file (`{region}.gust.bin`) baked by `ingest.py`. Slot times are local: Pacific, or Alaska time in
+the panhandle.
 
 **Send** (to the bot's Gmail address): `wx 49.36 -125.72` — the minus is optional — or just
 `wx` to use the inReach's own GPS fix.
