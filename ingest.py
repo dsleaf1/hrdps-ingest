@@ -61,6 +61,7 @@ REGION_NAMES = {
     "san-juan-gulf-islands": "San Juan & Gulf Islands", "puget-sound": "Puget Sound",
     "overview": "Whole extent (overview)", "coast-overview": "Whole coast (overview)",
     "pnw-rockies": "PNW & Rockies (overview)", "north-passage": "North Inside Passage (Prince Rupert-Skagway)",
+    "whole-coast": "Whole coast (Puget Sound-Sitka)",
 }
 
 # Whole-extent zoomed-out layers. The six regions above do NOT tile these extents: central Juan
@@ -78,6 +79,9 @@ OVERVIEWS = {
     # Sitka, Glacier Bay and Cross Sound. Joins coast-overview (which stops at 54.5 N) with a
     # small overlap; together they cover Port Townsend -> Skagway. Last: it contains no other box.
     "north-passage":  [-137.0, 54.4, -129.5, 59.6],
+    # Whole-coast WIND overview for the enlarged Marine Map (map-only: wind, no currents north of
+    # the Salish Sea). Union of the four map areas, Puget Sound -> Sitka/Baranof. Widest box, LAST.
+    "whole-coast":    [-137.0, 46.9, -122.0, 58.0],
 }
 OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
 
