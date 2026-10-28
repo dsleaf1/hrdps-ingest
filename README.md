@@ -26,6 +26,39 @@ The map app reads `hrdps/manifest.json` then `hrdps/{region}.bin` from the R2 pu
 direction bytes (row 0 = north). Hour offset = `h * 2 * rows * cols`.
 Decode: `kmh = speed_byte` (255 ⇒ no data); `deg = dir_byte * 360 / 255`.
 
+## Data footprint
+
+Per run each region stores `cols*rows` cells × `len(hours)` hours, times **2 bytes/cell/hour**
+for wind `{region}.bin` (speed + direction) and **1 byte/cell/hour** for gust `{region}.gust.bin`
+(speed only). Everything is gzipped on upload (`ContentEncoding: gzip`), so stored/served size is
+roughly **⅓ of raw** (the direction byte limits compression; measure exactly via the
+`--no-upload` run, which logs `raw -> gzipped`). The continental run has 49 hours (000–048). Raw
+sizes:
+
+| region | grid | cells | wind | gust |
+|---|---|---|---|---|
+| coast-overview | 517×339 | 175,263 | 17.2 MB | 8.6 MB |
+| north-passage | 334×232 | 77,488 | 7.6 MB | 3.8 MB |
+
+Deltas from recent changes (raw/run; ≈⅓ gzipped; ×4 runs/day):
+
+- **north-passage region** (inReach coverage to Skagway): **+11.4 MB/run** (wind 7.6 + gust 3.8),
+  ≈45 MB/day raw. Bot-only — the visual map never loads it.
+- **gusts** (`GUST_REGIONS` = coast-overview + north-passage): **+12.4 MB/run**, ≈50 MB/day raw.
+  Separate `.gust.bin` files, so the map's `{region}.bin` layout is untouched; only the bot
+  fetches them.
+
+Together ≈24 MB raw (~8 MB gzipped) per run, negligible against R2's 10 GB free tier. None of this
+touches the inReach link — the device always gets one ≤160-char text; the MB are R2 ↔ GitHub
+Actions only.
+
+**Projection — 1 km nest** (`hrdps_west`, res 0.009 vs 0.0225) on the six detailed (non-overview)
+regions: cells scale 6.25× (2.5×/axis), ×48/49 hours ≈ **6.1× per region**. Wind for those six
+goes 7.6 → 45.8 MB/run (**+38 MB**; +57 MB with gusts; ~150 MB/day raw). Overviews stay 2.5 km
+(`overview_res()` floors at 0.0225). The 1 km feed is experimental (`dd.alpha`), so treat it as
+additive to — not a replacement for — the always-present 2.5 km bake (see run-selection note in
+`inreach_bot.py` / ingest).
+
 ## Season archive (Model Replay step 1, live 2026-07-17)
 
 Alongside the latest-overwrite flow, each job retains the day's data under `archive/`
