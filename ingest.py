@@ -84,6 +84,8 @@ OVERVIEWS = {
     "whole-coast":    [-137.0, 46.9, -122.0, 58.0],
 }
 OVERVIEW_RES = 0.0225          # ~2.5 km; never finer than the model (see overview_res())
+OVERVIEW_RES_BY_KEY = {"whole-coast": 0.045}   # 5 km for the big NW-coast wind overview (map-only):
+                                               # ~1/3 the cells of 2.5 km, far lighter on phones.
 
 # Gusts (inReach text forecasts, inreach_bot.py). Baked to a SEPARATE {k}.gust.bin so the map's
 # {k}.bin layout and size check are untouched. One byte per cell per hour, km/h, 255 = nodata,
@@ -96,7 +98,7 @@ def overview_res():
     return max(RES, OVERVIEW_RES)
 
 def bbox_of(key):  return OVERVIEWS[key] if key in OVERVIEWS else REGIONS[key]
-def res_of(key):   return overview_res() if key in OVERVIEWS else RES
+def res_of(key):   return max(RES, OVERVIEW_RES_BY_KEY.get(key, OVERVIEW_RES)) if key in OVERVIEWS else RES
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
