@@ -85,6 +85,18 @@ for c in out["candidates"][:60]:
     md.append(f"- `{c['dir']}` ({c['n']} files) e.g. {c['sample'][:3]}")
 md.append("")
 
+# 2b. variables + forecast hours of the national 2.5 km system
+for c in out["candidates"]:
+    if "model_rdwps/national" in c["dir"]:
+        fl = [l for l in (links(c["dir"]) or []) if l.endswith(".grib2")]
+        labels = sorted({re.sub(r"_PT\d+H.*$", "", re.sub(r"^\d{8}T\d{2}Z_MSC_RDWPS_", "", f)) for f in fl})
+        hours = sorted({int(m.group(1)) for f in fl for m in [re.search(r"_PT(\d+)H", f)] if m})
+        md.append(f"## Variables in `{c['dir']}`")
+        md.append(f"- {len(labels)} variables, hours {hours[:3]}...{hours[-3:]} ({len(hours)} steps)")
+        md += [f"  - {l}" for l in labels]
+        md.append("")
+        break
+
 # 3. decode one significant-wave-height file per Pacific-looking domain
 def pick(c):
     for f in [x for x in c["sample"]] + []:
