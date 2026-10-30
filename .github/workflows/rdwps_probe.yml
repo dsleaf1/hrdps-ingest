@@ -1,0 +1,27 @@
+name: RDWPS coverage probe (one-off)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-dev
+      - run: pip install -r requirements.txt
+      - run: python rdwps_probe.py
+      - name: Push results to probe-results branch
+        if: always()
+        run: |
+          mkdir -p /tmp/keep && cp -r probe_out /tmp/keep/ 2>/dev/null || true
+          git checkout --orphan probe-results && git rm -rfq . && cp -r /tmp/keep/probe_out . 2>/dev/null || mkdir probe_out
+          git add probe_out && git -c user.name=bot -c user.email=bot@users.noreply.github.com commit -qm "rdwps probe" --allow-empty
+          git push -qf origin probe-results
