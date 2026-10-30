@@ -127,7 +127,9 @@ Sa24 SE12G20 SE15G25 S18G28 SW15G22 W10G15
 Su25 NW8G12 NW10G14 - - -
 ```
 Line 1: the point and the HRDPS run (UTC). Then one line per day, always five slots in local
-time **06 09 12 15 18**. `SE15G25` = wind *from* SE 15 kt gusting 25 kt; `C` = calm (<3 kt);
+time **06 09 12 15 18**. Each slot summarises the 3 hours centred on it (`09` = 08:00–10:00):
+average wind speed, direction of the strongest hour, highest gust; for `wv`, the highest wave height with
+that hour's period and direction. `SE15G25` = wind *from* SE 15 kt gusting 25 kt; `C` = calm (<3 kt);
 `-` = a slot already past (today) or beyond the end of the 48 h run. Today is shown from the
 current slot on; it is skipped only once 18:00 has passed.
 

@@ -155,8 +155,26 @@ def slot_code(kt, deg, gust):
         code += f"G{max(round(gust), k)}"
     return code
 
-def slot_lines(fc, cell, lat, lon, coder, now=None):
-    """One line per day: weekday+date then the 06 09 12 15 18 local slots, coded by coder(fc.at())."""
+WINDOW_H = (-1, 0, 1)        # each slot summarises the 3 hours centred on it (09 = 08:00-10:00)
+
+def wind_window(samples):
+    """3-hour wind slot: AVERAGE speed (typical conditions), direction of the strongest hour,
+    HIGHEST gust (worst case). samples: [(kt, dir, gust), ...]."""
+    ok = [x for x in samples if x[0] is not None]
+    if not ok:
+        return None, None, None
+    strongest = max(ok, key=lambda x: x[0])
+    gusts = [x[2] for x in ok if x[2] is not None]
+    return sum(x[0] for x in ok) / len(ok), strongest[1], (max(gusts) if gusts else None)
+
+def wave_window(samples):
+    """3-hour wave slot: the HIGHEST significant height, with that hour's period and direction."""
+    ok = [x for x in samples if x[0] is not None]
+    return max(ok, key=lambda x: x[0]) if ok else (None, None, None)
+
+def slot_lines(fc, cell, lat, lon, coder, now=None, window=wind_window):
+    """One line per day: weekday+date then the 06 09 12 15 18 local slots. Each slot = window()
+    over the hours in WINDOW_H around it that the run has, coded by coder()."""
     tz = local_tz(lat, lon)
     now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(tz)
     # Start today unless today's last slot is already over; slots more than an hour gone show "-".
@@ -167,12 +185,16 @@ def slot_lines(fc, cell, lat, lon, coder, now=None):
         idx = []
         for h in SLOTS:
             t = dt.datetime(day.year, day.month, day.day, h, tzinfo=tz).astimezone(dt.timezone.utc)
-            idx.append(fc.hour_index.get(t) if t >= cutoff else None)
+            if t < cutoff or t not in fc.hour_index:
+                idx.append(None)
+            else:
+                idx.append([fc.hour_index[t + dt.timedelta(hours=k)] for k in WINDOW_H
+                            if t + dt.timedelta(hours=k) in fc.hour_index])
         if all(i is None for i in idx):
             break
         # "-" marks a slot already past (today) or beyond the run's 48 h (last day), so the
         # 06/09/12/15/18 positions stay fixed.
-        codes = [coder(*fc.at(i, cell)) if i is not None else "-" for i in idx]
+        codes = [coder(*window([fc.at(j, cell) for j in i])) if i is not None else "-" for i in idx]
         lines.append(f"{DAYS[day.weekday()]}{day.day:02d} " + " ".join(codes))
         day += dt.timedelta(days=1)
     return lines
@@ -277,7 +299,7 @@ def build_wave_reply(waves, lat, lon, now=None):
         return [f"{lat:.2f},{lon:.2f} waves: no wave model water within {SEA_SEARCH_KM:.0f} km "
                 f"(narrow channel or inlet). Try a point in the open channel."]
     header = f"Waves {lat:.2f},{lon:.2f} {reg.run:%H}Z" + (f" @{km:.0f}km" if km >= 1.5 else "")
-    lines = slot_lines(reg, cell, lat, lon, wave_code, now)
+    lines = slot_lines(reg, cell, lat, lon, wave_code, now, window=wave_window)
     # keep to one message: drop a today line that has only one or two slots left
     while len(lines) > 1 and len(header) + sum(len(l) + 1 for l in lines) > MAX_LEN \
             and sum(c != "-" for c in lines[0].split()[1:]) <= 2:
