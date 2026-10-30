@@ -1,0 +1,35 @@
+name: RDWPS waves (inReach wv)
+
+on:
+  schedule:
+    - cron: "40 4,10,16,22 * * *"    # RDWPS runs 4x/day; ~4-5 h after 00/06/12/18Z
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = bake + upload ; test = 3 h, no upload"
+        type: choice
+        options: [full, test]
+        default: test
+
+concurrency:
+  group: waves-rdwps
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-dev
+      - run: pip install -r requirements.txt
+      - name: Bake
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python waves_rdwps.py ${{ github.event.inputs.mode == 'test' && '--no-upload --max-hours 3' || '' }}
