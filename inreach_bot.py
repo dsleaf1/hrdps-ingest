@@ -31,7 +31,7 @@ Local checks (no mail needed):
     python inreach_bot.py --point 49.36 -125.72           # print the reply for a point
     python inreach_bot.py --eml sample.eml --dry-run      # parse a saved email, print the reply
 """
-import os, re, sys, json, gzip, email, email.header, imaplib, smtplib, argparse
+import os, re, sys, json, gzip, math, email, email.header, imaplib, smtplib, argparse
 import datetime as dt
 import urllib.request, urllib.parse, urllib.error, http.cookiejar
 from email.message import EmailMessage
@@ -61,7 +61,7 @@ KMH_PER_KT = 1.852
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-HELP = "Send: wx LAT LON  e.g. wx 49.36 -125.72  (or just wx for your GPS spot)"
+HELP = "Send: wx LAT LON for wind, wv LAT LON for waves  e.g. wx 49.36 -125.72  (or just wx / wv for your GPS spot)"
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
@@ -155,12 +155,8 @@ def slot_code(kt, deg, gust):
         code += f"G{max(round(gust), k)}"
     return code
 
-def build_reply(fcs, lat, lon, now=None):
-    """Return a list of message strings (normally one). fcs: Forecasts (or a single Forecast)."""
-    fc = fcs.for_point(lat, lon) if isinstance(fcs, Forecasts) else fcs
-    cell = fc.cell(lat, lon) if fc else None
-    if cell is None:
-        return [f"{lat:.2f},{lon:.2f} is outside the forecast area ({AREA_TEXT})"]
+def slot_lines(fc, cell, lat, lon, coder, now=None):
+    """One line per day: weekday+date then the 06 09 12 15 18 local slots, coded by coder(fc.at())."""
     tz = local_tz(lat, lon)
     now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(tz)
     # Start today unless today's last slot is already over; slots more than an hour gone show "-".
@@ -176,13 +172,15 @@ def build_reply(fcs, lat, lon, now=None):
             break
         # "-" marks a slot already past (today) or beyond the run's 48 h (last day), so the
         # 06/09/12/15/18 positions stay fixed.
-        codes = [slot_code(*fc.at(i, cell)) if i is not None else "-" for i in idx]
+        codes = [coder(*fc.at(i, cell)) if i is not None else "-" for i in idx]
         lines.append(f"{DAYS[day.weekday()]}{day.day:02d} " + " ".join(codes))
         day += dt.timedelta(days=1)
-    header = f"{lat:.2f},{lon:.2f} {fc.run:%H}Z"
+    return lines
+
+def pack(header, lines):
+    """Header + day lines into <=160-char messages."""
     if not lines:
         return [header + " no 06-18 slots in this run, try later"]
-    # pack days into <=160-char messages, header on the first
     msgs, cur = [], header
     for ln in lines:
         if len(cur) + 1 + len(ln) <= MAX_LEN:
@@ -192,8 +190,102 @@ def build_reply(fcs, lat, lon, now=None):
     msgs.append(cur)
     return msgs
 
+def build_reply(fcs, lat, lon, now=None):
+    """Wind reply: list of message strings (normally one). fcs: Forecasts (or a single Forecast)."""
+    fc = fcs.for_point(lat, lon) if isinstance(fcs, Forecasts) else fcs
+    cell = fc.cell(lat, lon) if fc else None
+    if cell is None:
+        return [f"{lat:.2f},{lon:.2f} is outside the forecast area ({AREA_TEXT})"]
+    return pack(f"{lat:.2f},{lon:.2f} {fc.run:%H}Z", slot_lines(fc, cell, lat, lon, slot_code, now))
+
+# ---------------------------------------------------------------- waves (wv): ECCC RDWPS 2.5 km
+FLAT_M = 0.2                 # below this significant height the slot reads "F" (flat)
+SEA_SEARCH_KM = 5.0          # use the nearest model sea cell within this distance of the point
+
+class Waves:
+    """Latest RDWPS bake (waves_rdwps.py): manifest once, each region on first use."""
+    def __init__(self, base=R2_PUBLIC, loader=fetch):
+        self.base, self.loader, self.cache = base, loader, {}
+        self.man = json.loads(loader(f"{base}/rdwps/manifest.json"))
+        self.run = dt.datetime.strptime(self.man["run"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        self.hour_index = {dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc): i
+                           for i, t in enumerate(self.man["hours"])}
+
+    def region_for(self, lat, lon):
+        for k in REGIONS:
+            reg = self.man["regions"].get(k)
+            if reg:
+                W, S, E, N = reg["bbox"]
+                if W <= lon <= E and S <= lat <= N:
+                    if k not in self.cache:
+                        self.cache[k] = WaveRegion(self, reg)
+                    return self.cache[k]
+        return None
+
+class WaveRegion:
+    def __init__(self, w, reg):
+        self.run, self.hour_index = w.run, w.hour_index
+        self.bbox, self.cols, self.rows = reg["bbox"], reg["cols"], reg["rows"]
+        self.span = self.cols * self.rows
+        self.data = w.loader(f"{w.base}/rdwps/{reg['file']}")
+        if len(self.data) != len(w.man["hours"]) * 3 * self.span:
+            raise RuntimeError(f"wave file is {len(self.data)} B, expected {len(w.man['hours']) * 3 * self.span}")
+
+    def sea_cell(self, lat, lon):
+        """-> (cell, km) of the nearest cell with wave data within SEA_SEARCH_KM, or (None, None)."""
+        W, S, E, N = self.bbox
+        dlat, dlon = (N - S) / (self.rows - 1), (E - W) / (self.cols - 1)
+        r0, c0 = round((N - lat) / dlat), round((lon - W) / dlon)
+        kx = 111.0 * math.cos(math.radians(lat))
+        best = (None, None)
+        rr, rc = int(SEA_SEARCH_KM / (dlat * 111.0)) + 1, int(SEA_SEARCH_KM / (dlon * kx)) + 1
+        for r in range(max(0, r0 - rr), min(self.rows, r0 + rr + 1)):
+            for c in range(max(0, c0 - rc), min(self.cols, c0 + rc + 1)):
+                cell = r * self.cols + c
+                if self.data[cell] == 255:                       # hour 0 height: land / no model
+                    continue
+                km = math.hypot((N - r * dlat - lat) * 111.0, (W + c * dlon - lon) * kx)
+                if km <= SEA_SEARCH_KM and (best[1] is None or km < best[1]):
+                    best = (cell, km)
+        return best
+
+    def at(self, hour_i, cell):
+        """(height_m, period_s, dir_from_deg); height None if no data."""
+        base = hour_i * 3 * self.span
+        h = self.data[base + cell]
+        if h == 255:
+            return None, None, None
+        p = self.data[base + self.span + cell]
+        d = self.data[base + 2 * self.span + cell]
+        return h / 10, (None if p == 255 else p), (None if d == 255 else d * 360 / 255)
+
+def wave_code(hs, tp, deg):
+    """SW1.2/8 = from SW, 1.2 m significant height, 8 s period;  F = under 0.2 m."""
+    if hs is None:
+        return "-"
+    if hs < FLAT_M:
+        return "F"
+    code = (COMPASS[round(deg / 22.5) % 16] if deg is not None else "") + f"{hs:.1f}"
+    return code + (f"/{tp}" if tp else "")
+
+def build_wave_reply(waves, lat, lon, now=None):
+    reg = waves.region_for(lat, lon)
+    if reg is None:
+        return [f"{lat:.2f},{lon:.2f} is outside the wave forecast area ({AREA_TEXT})"]
+    cell, km = reg.sea_cell(lat, lon)
+    if cell is None:
+        return [f"{lat:.2f},{lon:.2f} waves: no wave model water within {SEA_SEARCH_KM:.0f} km "
+                f"(narrow channel or inlet). Try a point in the open channel."]
+    header = f"Waves {lat:.2f},{lon:.2f} {reg.run:%H}Z" + (f" @{km:.0f}km" if km >= 1.5 else "")
+    lines = slot_lines(reg, cell, lat, lon, wave_code, now)
+    # keep to one message: drop a today line that has only one or two slots left
+    while len(lines) > 1 and len(header) + sum(len(l) + 1 for l in lines) > MAX_LEN \
+            and sum(c != "-" for c in lines[0].split()[1:]) <= 2:
+        lines = lines[1:]
+    return pack(header, lines)
+
 # ---------------------------------------------------------------- parsing requests
-CMD_RE = re.compile(r"(?i)(?<![a-z])wx\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
+CMD_RE = re.compile(r"(?i)(?<![a-z])(wx|wv)\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
 GPS_RE = re.compile(r"(?i)\blat(?:itude)?[:\s]+(-?\d{1,2}\.\d+)[^\d-]+lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+)")
 LINK_RE = re.compile(r"https://(?:inreachlink\.com/[A-Za-z0-9_-]+|[^\s\"'<>]*garmin\.com/textmessage/txtmsg\?"
                      r"[^\s\"'<>]*extId=[^\s\"'<>]+)", re.I)
@@ -214,7 +306,7 @@ def message_text(msg):
     return re.sub(r"<[^>]+>", " ", "\n".join(html)).replace("&amp;", "&")
 
 def parse_request(text):
-    """-> (lat, lon) | 'gps-missing' | None (not a wx request)."""
+    """-> (lat, lon, kind) with kind 'wx' (wind) or 'wv' (waves) | 'gps-missing' | None."""
     # Only the user's own message: Garmin appends the reply link and GPS line below it.
     head = re.split(r"(?i)view the location|send a reply|sent this message from", text)[0]
     head = head.replace("\u2212", "-").replace("\u2013", "-").replace("\u00b0", "")  # phone/Mac auto-typography
@@ -222,8 +314,9 @@ def parse_request(text):
     m = CMD_RE.search(head)
     if not m:
         return None
-    if m.group(1):
-        lat, lon = float(m.group(1)), float(m.group(2))
+    kind = m.group(1).lower()
+    if m.group(2):
+        lat, lon = float(m.group(2)), float(m.group(3))
     elif re.search(r"\d", head[m.end():m.end() + 30]):
         return "gps-missing"                      # numbers typed but unreadable: ask, don't guess
     else:
@@ -235,7 +328,7 @@ def parse_request(text):
         lon = -lon
     if not (-90 <= lat <= 90 and -180 <= lon <= 180):
         return "gps-missing"
-    return lat, lon
+    return lat, lon, kind
 
 def reply_link(text):
     m = LINK_RE.search(text)
@@ -319,7 +412,10 @@ def handle(msg, fc_loader, allowed):
         return ([HELP] if link else None), link, sender
     if req == "gps-missing":
         return [HELP], link, sender
-    return build_reply(fc_loader(), *req), link, sender
+    lat, lon, kind = req
+    if kind == "wv":
+        return build_wave_reply(fc_loader("wv"), lat, lon), link, sender
+    return build_reply(fc_loader(), lat, lon), link, sender
 
 def mask(t):
     """Hide location digits and private IDs/tokens so the dump is safe in a public run log."""
@@ -384,6 +480,7 @@ def inspect_latest(im):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"))
+    ap.add_argument("--waves", action="store_true", help="with --point: the wv (waves) reply")
     ap.add_argument("--eml", help="process one saved .eml file instead of the inbox")
     ap.add_argument("--dry-run", action="store_true", help="print replies, send nothing, mark nothing read")
     ap.add_argument("--inspect", action="store_true",
@@ -393,13 +490,14 @@ def main():
     args = ap.parse_args()
 
     fc_cache = {}
-    def fc_loader():
-        if "fc" not in fc_cache:
-            fc_cache["fc"] = Forecasts()
-        return fc_cache["fc"]
+    def fc_loader(kind="wx"):
+        if kind not in fc_cache:
+            fc_cache[kind] = Waves() if kind == "wv" else Forecasts()
+        return fc_cache[kind]
 
     if args.point:
-        print("\n---\n".join(build_reply(fc_loader(), *args.point)))
+        fn = build_wave_reply if args.waves else build_reply
+        print("\n---\n".join(fn(fc_loader("wv" if args.waves else "wx"), *args.point)))
         return
     allowed = [a.strip().lower() for a in os.environ.get("ALLOWED_SENDERS", "").split(",") if a.strip()]
     if args.eml:
