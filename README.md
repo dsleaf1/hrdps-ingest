@@ -111,6 +111,8 @@ python ingest.py --no-upload --regions haida-gwaii --max-hours 3
 
 ## inReach wind bot (`inreach_bot.py`, `.github/workflows/inreach.yml`)
 
+Full walkthrough of the data pipeline and reply format: [`docs/INREACH_PIPELINE.md`](docs/INREACH_PIPELINE.md).
+
 Text a position from a Garmin inReach, get back the HRDPS 2.5 km wind for that spot in one
 ≤160-character message. Coverage is Port Townsend → Skagway: the map's `coast-overview` bake
 (to 54.5 N) plus `north-passage` (Prince Rupert → Skagway, Sitka, Glacier Bay), each with a gust
