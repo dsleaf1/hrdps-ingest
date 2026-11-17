@@ -401,8 +401,9 @@ HRDPS reaches 48 hours, so only **today and tomorrow** can be served. Any other 
 ### 11.2 The reply
 
 ```
-51.23,-123.90 Tu17 18Z
-2000/3000m FZmax1250
+51.23,-123.90 18Z
+Tu17 FZmax1250
+2000/3000m
 04 SW14/SSW12 0
 08 SW9/S3 0
 12 C/E11 0
@@ -412,10 +413,11 @@ HRDPS reaches 48 hours, so only **today and tomorrow** can be served. Any other 
 
 | Part | Meaning |
 |---|---|
-| Line 1 | The point, the day the forecast is for, and the HRDPS run (UTC) |
-| `2000/3000m` | The elevations, in the order used on every slot line |
+| Line 1 | The point and the HRDPS run (UTC), the same as a `wx` header |
+| `Tu17` | The day the forecast is for |
 | `FZmax1250` | The highest freezing level that day, in metres, to the nearest 50. `0` = below freezing all the way down; `>4500` = above the model levels used |
-| `gnd1760` | Appears only when an elevation you asked for is below the model's terrain at that cell |
+| `2000/3000m` | The elevations, in the order used on every slot line |
+| `gnd1760` | Follows the elevations only when one you asked for is below the model's terrain at that cell |
 | `04` … `20` | Local hour of the slot |
 | `SW14/SSW12` | Wind **from** the SW at 14 km/h at the first elevation, from the SSW at 12 km/h at the second. `C` = calm (under 3 km/h) |
 | last number | Precipitation in mm over the 4 hours ending at that slot. `T` = trace (under 0.5 mm) |
@@ -430,7 +432,8 @@ Things to keep in mind:
 - The model's terrain is smoothed to 2.5 km, so real summits stand above it and real valleys lie below it. Wind at 3000 m over a 3000 m summit is closer to free-air wind than to what you will feel in the lee of the ridge.
 - Precipitation is a forecast **amount**, not a probability, and is liquid-equivalent: multiply by roughly 10 for centimetres of snow.
 - Slot hours are **British Columbia time**, which stays on UTC-7 all year from 2026. In Washington in winter the slots are therefore one hour earlier on the local clock (`04` is 03:00 PST).
-- If a reply would exceed 160 characters (three elevations with strong winds and heavy precipitation), the bot first shortens compass names to eight points, then drops the latest slots.
+- The header is split over three short lines because an inReach screen wraps a line at about 20 characters.
+- If a slot line would pass 20 characters, or the reply would exceed 160 (three elevations with strong winds and heavy precipitation), the bot shortens compass names to eight points (`SW` instead of `WSW`). If the reply is still over 160 it drops the latest slots.
 
 ### 11.3 Preparing the data (`mountain.py`)
 
