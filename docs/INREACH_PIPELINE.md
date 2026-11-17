@@ -327,7 +327,7 @@ Things to keep in mind when reading wave heights:
 
 | Reply | What happened |
 |---|---|
-| `Send: wx LAT LON for wind, wv LAT LON for waves …` | The request couldn't be read, or plain `wx`/`wv` arrived with no GPS position |
+| `Send: wx LAT LON wind, wv LAT LON waves, mt LAT LON DAY mountain …` | The request couldn't be read, or plain `wx`/`wv` arrived with no GPS position |
 | `… is outside the forecast area (Puget Sd to Skagway, 47-59.6N)` | The point isn't in either region; check the numbers, latitude first |
 | `… waves: no wave model water within 5 km …` | A `wv` point in a channel or inlet too narrow for the wave model; try the nearest open water |
 | `… no 06-18 slots in this run, try later` | Rare: the newest run doesn't cover any remaining daytime slot |
@@ -368,6 +368,9 @@ Things to keep in mind when reading wave heights:
 | `apps_script/dispatch.gs` | Runs in the bot's Gmail; starts the bot within a minute of new mail |
 | `.github/workflows/ingest.yml` | Wind bake schedule (05:05, 11:05, 17:05, 23:05 UTC) |
 | `.github/workflows/waves_rdwps.yml` | Wave bake schedule (04:40, 10:40, 16:40, 22:40 UTC) |
+| `mountain.py` | HRDPS wind aloft, freezing level and precipitation bake for `mt` |
+| `.github/workflows/mountain.yml` | Mountain bake schedule (05:25, 11:25, 17:25, 23:25 UTC) |
+| `test_mt.py` | Offline tests for the mountain maths and the `mt` command |
 | `.github/workflows/inreach.yml` | The bot (started by Apps Script; 10-minute backup schedule) |
 
 **Secrets** (repository settings → Actions):
@@ -376,3 +379,104 @@ Things to keep in mind when reading wave heights:
 - `INREACH_ALLOWED_SENDERS` (optional): restrict who gets answers
 
 The Apps Script stores its GitHub token in its own **Script Properties** as `GITHUB_TOKEN`.
+
+---
+
+## 11. Mountain forecasts (`mt`)
+
+`mt` answers a climber's question for **one day**: how windy is it at my elevations, where is the freezing level, and will it precipitate?
+
+### 11.1 Sending
+
+| Request | Meaning |
+|---|---|
+| `mt 17` | The 17th, at the inReach's own GPS position, at 2000 m and 3000 m |
+| `mt 51.23 -123.90 17` | The 17th at another point. Coordinates must have a decimal point; the minus on longitude is optional |
+| `mt 17 2500 3500` | Choose up to three elevations, each 500 to 4500 m |
+
+The **day of the month is required**. The bot tells the numbers apart by their form: two decimals first are coordinates, a whole number from 1 to 31 is the day, and whole numbers from 300 up are elevations.
+
+HRDPS reaches 48 hours, so only **today and tomorrow** can be served. Any other day gets `No mt forecast for day 19: HRDPS reaches 48 h. Available: Tu17 We18`. A day is never shown cut off partway.
+
+### 11.2 The reply
+
+```
+51.23,-123.90 Tu17 18Z
+2000/3000m FZmax1250
+04 SW14/SSW12 0
+08 SW9/S3 0
+12 C/E11 0
+16 E7/E15 T
+20 E14/E18 3
+```
+
+| Part | Meaning |
+|---|---|
+| Line 1 | The point, the day the forecast is for, and the HRDPS run (UTC) |
+| `2000/3000m` | The elevations, in the order used on every slot line |
+| `FZmax1250` | The highest freezing level that day, in metres, to the nearest 50. `0` = below freezing all the way down; `>4500` = above the model levels used |
+| `gnd1760` | Appears only when an elevation you asked for is below the model's terrain at that cell |
+| `04` … `20` | Local hour of the slot |
+| `SW14/SSW12` | Wind **from** the SW at 14 km/h at the first elevation, from the SSW at 12 km/h at the second. `C` = calm (under 3 km/h) |
+| last number | Precipitation in mm over the 4 hours ending at that slot. `T` = trace (under 0.5 mm) |
+| `-` | No data: beyond the run, or that elevation is below the model's terrain |
+
+For **today's** date the reply starts at the most recent slot and continues with those still ahead, and the freezing-level maximum covers only that remaining part of the day.
+
+Things to keep in mind:
+
+- **Units are km/h**, not knots as in `wx`.
+- Winds are the model's value at one instant (the slot hour), not a 3-hour summary.
+- The model's terrain is smoothed to 2.5 km, so real summits stand above it and real valleys lie below it. Wind at 3000 m over a 3000 m summit is closer to free-air wind than to what you will feel in the lee of the ridge.
+- Precipitation is a forecast **amount**, not a probability, and is liquid-equivalent: multiply by roughly 10 for centimetres of snow.
+- Slot hours are **British Columbia time**, which stays on UTC-7 all year from 2026. In Washington in winter the slots are therefore one hour earlier on the local clock (`04` is 03:00 PST).
+- If a reply would exceed 160 characters (three elevations with strong winds and heavy precipitation), the bot first shortens compass names to eight points, then drops the latest slots.
+
+### 11.3 Preparing the data (`mountain.py`)
+
+**When:** 05:25, 11:25, 17:25 and 23:25 UTC, after the wind ingest.
+
+**Source:** the same HRDPS Continental 2.5 km runs, on ten pressure levels from 1000 to 550 hPa: wind speed and direction (`WIND_ISBL`, `WDIR_ISBL`), level height (`HGT_ISBL`) and temperature (`TMP_ISBL`), plus accumulated precipitation (`APCP_Sfc`) and model terrain (`HGT_Sfc`).
+
+**Steps**
+
+1. **Find the newest complete run**: one whose hour-48 folder already holds the wind, temperature and precipitation files.
+2. **Pick the hours to bake**: every local 04, 08, 12, 16 and 20 the run covers, plus 14:00 for temperature only. That is about 12 time steps instead of 49, which keeps the download near 500 MB per run.
+3. **Wind at fixed heights.** Pressure levels drift up and down with the weather, so each level's own height is used to interpolate the wind to 500, 1000, … 4500 m above sea level. The interpolation is done on the east and north components, so a wind swinging through north is handled correctly.
+4. **Freezing level**: the highest point in the column where the temperature crosses 0 °C. With a temperature inversion there can be several crossings; the highest is the one that decides rain or snow up high.
+5. **Precipitation**: the accumulated total at the slot minus the total 4 hours earlier.
+6. **Pack and upload** to R2 under `mt/`.
+
+### 11.4 File layout
+
+Unlike the wind and wave files, the mountain file is **not compressed and is ordered cell by cell**. Everything about one cell sits together in one short record, so the bot fetches just that record with a single HTTP Range request instead of downloading the region.
+
+```
+record  = [terrain] + for each step: ( [speed][direction] for each of the 9 heights ) + [freezing level] + [precip]
+offset  = cell_index × record_len          cell_index = row × cols + col, row 0 = north
+```
+
+| Byte | Decoding |
+|---|---|
+| terrain | × 20 = metres |
+| speed | km/h |
+| direction | × 360 / 255 = degrees the wind blows from |
+| freezing level | × 20 = metres; 254 = above the top level |
+| precip | 0–100 = tenths of a mm; 101–254 = that value minus 90, in whole mm |
+| 255 | no data, in every field |
+
+The file is named by run hour (`coast-overview.18.bin`) and the manifest (`mt/manifest.json`) names the file to read, lists the steps in UTC and in local time, and gives `record_len`. Because the manifest is uploaded last and each run writes a differently named file, the bot never reads a file that is half replaced.
+
+For an elevation between two stored heights, the bot interpolates between them, again on the wind components.
+
+### 11.5 Coverage and limits
+
+- **Region:** `coast-overview` only (46.9–54.5°N, 122.0–133.6°W): the Coast Mountains, Vancouver Island and the Olympics. It stops just west of the North Cascades.
+- **Not included yet:** precipitation type and snow level, the Rockies and Columbias, Alaska time.
+
+### 11.6 Checking it
+
+- `python test_mt.py`: offline tests of the maths, the reply format and request parsing.
+- `python inreach_bot.py --point 51.23 -123.90 --mt 17 --elev 2500 3500`: print a live reply.
+- GitHub → Actions → **HRDPS mountain (inReach mt)** → Run workflow in *test* mode: bakes four steps from the live Datamart without uploading and prints a summary line (terrain, wind, freezing level, download size).
+- For a ground-truth check, request `mt` at the coordinates of an [Avalanche Canada meteogram](https://meteograms.avalanche.ca/ac/ac_meteogram.html) point at 2000 and 3000 m and compare with its printed 2 km and 3 km winds from the same run.
