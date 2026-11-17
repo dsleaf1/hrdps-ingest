@@ -22,12 +22,16 @@ MOUNTAIN REQUEST (wind aloft, freezing level, precipitation for ONE day; the day
     mt 17 2500 3500         choose up to three elevations, 500-4500 m
 
 MOUNTAIN REPLY (one message, <= 160 chars):
-    51.23,-123.90 Tu17 18Z
-    2000/3000m FZmax1250
+    51.23,-123.90 18Z
+    Tu17 FZmax1250
+    2000/3000m
     04 SW14/SSW12 0
     08 SW9/S3 0
     ...
-    - line 2: the elevations, then the day's highest freezing level (m)
+    - line 1: the point and the HRDPS run (UTC), as for wx
+    - line 2: the day, then that day's highest freezing level (m)
+    - line 3: the elevations (plus gndNNNN = model terrain, when one of them is below it)
+    - no line is meant to pass 20 characters, where an inReach screen wraps
     - each slot: local hour, wind FROM / km/h at each elevation, then mm of precipitation in the
       4 hours before it (T = trace, under 0.5 mm);  C = calm;  - = no data / below model terrain
     - today's date gives the most recent slot and those still ahead
@@ -342,6 +346,7 @@ def build_wave_reply(waves, lat, lon, now=None):
 MT_SLOTS = (4, 8, 12, 16, 20)             # local hours, in reply order
 MT_DEFAULT_ELEV = (2000, 3000)
 MT_ELEV_RANGE = (500, 4500)
+MT_LINE = 20                              # characters an inReach screen shows before wrapping a line
 MT_AREA_TEXT = "BC/WA coast ranges, 46.9-54.5N, W of 122W"
 COMPASS8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
 
@@ -470,10 +475,11 @@ def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None):
     fz = [cellrec.freezing(i) for (d, h), i in mt.local_index.items() if d == day and h >= plan[0][0]]
     fz = [x for x in fz if x is not None]
     fzmax = "-" if not fz else ">4500" if max(fz) == math.inf else str(int(round(max(fz) / 50.0)) * 50)
-    line2 = "/".join(str(e) for e in elevs) + f"m FZmax{fzmax}"
+    line3 = "/".join(str(e) for e in elevs) + "m"
     if cellrec.terrain is not None and any(e < cellrec.terrain for e in elevs):
-        line2 += f" gnd{cellrec.terrain}"
-    header = f"{lat:.2f},{lon:.2f} {label(day)} {mt.run:%H}Z\n{line2}"
+        line3 += f" gnd{cellrec.terrain}"
+    # three short header lines: an inReach screen wraps at about 20 characters
+    header = f"{lat:.2f},{lon:.2f} {mt.run:%H}Z\n{label(day)} FZmax{fzmax}\n{line3}"
 
     def lines(points):
         out = []
@@ -485,7 +491,7 @@ def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None):
                            + " " + mt_precip_code(cellrec.precip(i)))
         return out
     body = lines(16)
-    if len(header) + sum(len(l) + 1 for l in body) > MAX_LEN:
+    if len(header) + sum(len(l) + 1 for l in body) > MAX_LEN or any(len(l) > MT_LINE for l in body):
         body = lines(8)                                    # shorter compass names first
     while len(body) > 1 and len(header) + sum(len(l) + 1 for l in body) > MAX_LEN:
         body.pop()                                         # then drop the latest slot
