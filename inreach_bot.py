@@ -16,6 +16,22 @@ REPLY (one message, <= 160 chars):
     - SE15G25 = wind FROM the SE at 15 kt, gusting 25 kt;  C = calm (< 3 kt)
     - "-" = a slot already past (today) or beyond the run's 48 h (last day); positions stay fixed
 
+MOUNTAIN REQUEST (wind aloft, freezing level, precipitation for ONE day; the day is required):
+    mt 17                   day of the month, at the inReach's own GPS fix, 2000 and 3000 m
+    mt 51.23 -123.90 17     another point (coordinates need a decimal point)
+    mt 17 2500 3500         choose up to three elevations, 500-4500 m
+
+MOUNTAIN REPLY (one message, <= 160 chars):
+    51.23,-123.90 Tu17 18Z
+    2000/3000m FZmax1250
+    04 SW14/SSW12 0
+    08 SW9/S3 0
+    ...
+    - line 2: the elevations, then the day's highest freezing level (m)
+    - each slot: local hour, wind FROM / km/h at each elevation, then mm of precipitation in the
+      4 hours before it (T = trace, under 0.5 mm);  C = calm;  - = no data / below model terrain
+    - today's date gives the most recent slot and those still ahead
+
 DATA: reads the same Cloudflare R2 files the Salish marine map reads (hrdps/manifest.json +
 coast-overview.bin), plus coast-overview.gust.bin baked by ingest.py. Nearest 2.5 km cell.
 
@@ -61,7 +77,10 @@ KMH_PER_KT = 1.852
 COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
            "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
 DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
-HELP = "Send: wx LAT LON for wind, wv LAT LON for waves  e.g. wx 49.36 -125.72  (or just wx / wv for your GPS spot)"
+HELP = ("Send: wx LAT LON wind, wv LAT LON waves, mt LAT LON DAY mountain. "
+        "e.g. wx 49.36 -125.72 or mt 51.23 -123.90 17. No LAT LON = your GPS spot")
+MT_HELP = ("mt needs the day of month: mt 17 (your GPS spot) or mt 51.23 -123.90 17. "
+           "Optional elevations 500-4500 m: mt 17 2500 3500")
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
@@ -77,6 +96,19 @@ def fetch(url, timeout=120):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         b = r.read()
     return gzip.decompress(b) if b[:2] == b"\x1f\x8b" else b
+
+def fetch_range(url, start, length, timeout=120):
+    """`length` bytes at `start` of a remote file, by HTTP Range. If the server ignores the Range
+    header and sends the whole file, slice it here instead."""
+    req = urllib.request.Request(url, headers={"User-Agent": "inreach-wx-bot",
+                                               "Range": f"bytes={start}-{start + length - 1}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        status, b = r.status, r.read()
+    if status == 206:
+        return b
+    if b[:2] == b"\x1f\x8b":
+        b = gzip.decompress(b)
+    return b[start:start + length]
 
 class Forecasts:
     """The latest HRDPS bake: manifest read once, each region's files fetched on first use."""
@@ -306,7 +338,184 @@ def build_wave_reply(waves, lat, lon, now=None):
         lines = lines[1:]
     return pack(header, lines)
 
+# ---------------------------------------------------------------- mountain (mt): HRDPS aloft
+MT_SLOTS = (4, 8, 12, 16, 20)             # local hours, in reply order
+MT_DEFAULT_ELEV = (2000, 3000)
+MT_ELEV_RANGE = (500, 4500)
+MT_AREA_TEXT = "BC/WA coast ranges, 46.9-54.5N, W of 122W"
+COMPASS8 = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+def utc(s):
+    return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+
+class Mountain:
+    """Latest mountain bake (mountain.py). One cell's whole record comes from a single Range read."""
+    def __init__(self, base=R2_PUBLIC, loader=fetch, ranger=fetch_range):
+        self.base, self.ranger = base, ranger
+        self.man = json.loads(loader(f"{base}/mt/manifest.json"))
+        self.run = utc(self.man["run"])
+        self.tz = ZoneInfo(self.man["tz"])
+        # slots are matched on the bake's own local labels ("YYYY-MM-DDTHH"), not recomputed here
+        self.local_index = {(dt.date.fromisoformat(s[:10]), int(s[11:13])): i
+                            for i, s in enumerate(self.man["steps_local"])}
+        self.heights = self.man["heights_m"]
+        self.step_len, self.rec_len = self.man["step_len"], self.man["record_len"]
+        if self.step_len != 2 * len(self.heights) + 2 or self.rec_len != 1 + len(self.man["steps"]) * self.step_len:
+            raise RuntimeError("mt manifest: record layout does not match heights/steps")
+
+    def record(self, lat, lon):
+        """-> MtCell for the nearest 2.5 km cell, or None outside every region."""
+        for reg in self.man["regions"].values():
+            W, S, E, N = reg["bbox"]
+            if W <= lon <= E and S <= lat <= N:
+                c = round((lon - W) / (E - W) * (reg["cols"] - 1))
+                r = round((N - lat) / (N - S) * (reg["rows"] - 1))
+                rec = self.ranger(f"{self.base}/mt/{reg['file']}", (r * reg["cols"] + c) * self.rec_len, self.rec_len)
+                if len(rec) != self.rec_len:
+                    raise RuntimeError(f"mt record is {len(rec)} B, expected {self.rec_len}")
+                return MtCell(self, rec)
+        return None
+
+class MtCell:
+    def __init__(self, mt, rec):
+        self.mt, self.rec = mt, rec
+        self.terrain = None if rec[0] == 255 else rec[0] * 20
+
+    def _level(self, i, k):
+        o = 1 + i * self.mt.step_len + 2 * k
+        s = self.rec[o]
+        if s == 255:
+            return None
+        a = math.radians(self.rec[o + 1] * 360 / 255)
+        return -s * math.sin(a), -s * math.cos(a)             # u, v in km/h
+
+    def wind(self, i, elev):
+        """(km/h, dir_from_deg) at `elev` m for step i, interpolated between the 500 m heights;
+        None if there is no data or the elevation is below the model's terrain."""
+        hs = self.mt.heights
+        if self.terrain is not None and elev < self.terrain:
+            return None
+        k = max(j for j, h in enumerate(hs) if h <= elev) if elev >= hs[0] else None
+        if k is None:
+            return None
+        lo = self._level(i, k)
+        if hs[k] == elev or k == len(hs) - 1:
+            uv = lo if hs[k] == elev else None
+        else:
+            hi = self._level(i, k + 1)
+            w = (elev - hs[k]) / (hs[k + 1] - hs[k])
+            uv = None if lo is None or hi is None else (lo[0] * (1 - w) + hi[0] * w, lo[1] * (1 - w) + hi[1] * w)
+        if uv is None:
+            return None
+        return math.hypot(*uv), math.degrees(math.atan2(-uv[0], -uv[1])) % 360
+
+    def freezing(self, i):
+        """Freezing level in m; math.inf = above the model's top level; None = no data."""
+        b = self.rec[1 + i * self.mt.step_len + 2 * len(self.mt.heights)]
+        return None if b == 255 else math.inf if b == 254 else b * 20
+
+    def precip(self, i):
+        """mm in the hours before step i (manifest precip_hours), or None."""
+        b = self.rec[1 + i * self.mt.step_len + 2 * len(self.mt.heights) + 1]
+        return None if b == 255 else b / 10 if b <= 100 else b - 90
+
+def mt_wind_code(w, points=16):
+    if w is None:
+        return "-"
+    k = round(w[0])
+    if k < 3:
+        return "C"
+    names = COMPASS if points == 16 else COMPASS8
+    return f"{names[round(w[1] / (360 / len(names))) % len(names)]}{k}"
+
+def mt_precip_code(mm):
+    if mm is None:
+        return "-"
+    return "0" if mm < 0.05 else "T" if mm < 0.5 else str(round(mm))
+
+def mt_day_plan(mt, day, now):
+    """Which of `day`'s slots to report. -> [(local_hour, step index or None)], or None when the
+    run cannot serve that day. Today: the most recent slot and those ahead. Later days: served only
+    if the run reaches at least the first four slots, so a day is never cut off partway."""
+    slots = []
+    for h in MT_SLOTS:
+        t = dt.datetime(day.year, day.month, day.day, h, tzinfo=mt.tz)
+        slots.append((h, t, mt.local_index.get((day, h))))
+    if day == now.date():
+        gap = dt.timedelta(hours=MT_SLOTS[1] - MT_SLOTS[0])
+        slots = [x for x in slots if x[1] > now - gap]
+        return [(h, i) for h, t, i in slots] if any(i is not None for _, _, i in slots) else None
+    if day < now.date() or any(i is None for _, _, i in slots[:4]):
+        return None
+    return [(h, i) for h, t, i in slots]
+
+def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None):
+    """Mountain reply for day-of-month `dom`: one message string in a list."""
+    elevs = list(elevs or MT_DEFAULT_ELEV)
+    cellrec = mt.record(lat, lon)
+    if cellrec is None:
+        return [f"{lat:.2f},{lon:.2f} is outside the mt forecast area ({MT_AREA_TEXT})"]
+    now = (now or dt.datetime.now(dt.timezone.utc)).astimezone(mt.tz)     # the bake's zone, see Mountain
+    days = [now.date() + dt.timedelta(days=d) for d in range(0, 4)]
+    plans = {d: mt_day_plan(mt, d, now) for d in days}
+    label = lambda d: f"{DAYS[d.weekday()]}{d.day:02d}"
+    day = next((d for d in days if d.day == dom), None)
+    if day is None or plans[day] is None:
+        ok = " ".join(label(d) for d in days if plans[d])
+        return [f"No mt forecast for day {dom}: HRDPS reaches 48 h. Available: {ok}" if ok
+                else "No mt forecast available right now, try again in an hour"]
+    plan = plans[day]
+
+    # freezing-level maximum: every baked sample of that day from the first reported slot on
+    fz = [cellrec.freezing(i) for (d, h), i in mt.local_index.items() if d == day and h >= plan[0][0]]
+    fz = [x for x in fz if x is not None]
+    fzmax = "-" if not fz else ">4500" if max(fz) == math.inf else str(int(round(max(fz) / 50.0)) * 50)
+    line2 = "/".join(str(e) for e in elevs) + f"m FZmax{fzmax}"
+    if cellrec.terrain is not None and any(e < cellrec.terrain for e in elevs):
+        line2 += f" gnd{cellrec.terrain}"
+    header = f"{lat:.2f},{lon:.2f} {label(day)} {mt.run:%H}Z\n{line2}"
+
+    def lines(points):
+        out = []
+        for h, i in plan:
+            if i is None:
+                out.append(f"{h:02d} -")
+            else:
+                out.append(f"{h:02d} " + "/".join(mt_wind_code(cellrec.wind(i, e), points) for e in elevs)
+                           + " " + mt_precip_code(cellrec.precip(i)))
+        return out
+    body = lines(16)
+    if len(header) + sum(len(l) + 1 for l in body) > MAX_LEN:
+        body = lines(8)                                    # shorter compass names first
+    while len(body) > 1 and len(header) + sum(len(l) + 1 for l in body) > MAX_LEN:
+        body.pop()                                         # then drop the latest slot
+    return ["\n".join([header] + body)]
+
 # ---------------------------------------------------------------- parsing requests
+MT_RE = re.compile(r"(?i)(?<![a-z])mt(?![a-z])([^\n]*)")     # also "mt17"
+
+def parse_mt_args(s):
+    """'51.23 -123.90 17 2500 3500' -> (lat or None, lon or None, day, [elevations]) | None if unreadable.
+    Numbers are told apart by form: two decimals first = coordinates, a whole number 1-31 = day of
+    month, whole numbers from 300 up = elevations in metres (500-4500 accepted)."""
+    s = re.sub(r"(?i)(?<=\d)\s*[mnw]\b", " ", s[:70])        # 2500m, 51.23N, 123.9W
+    s = re.sub(r"(?<=\d)-(?=\d)", " ", s.replace(",", " ").replace("/", " "))   # 2500-3500, 2500/3500
+    toks = re.findall(r"-?\d+(?:\.\d+)?", s)
+    dec = [t for t in toks if "." in t]
+    ints = [int(t) for t in toks if "." not in t]
+    lat = lon = None
+    if dec:
+        if len(dec) != 2 or toks[:2] != dec:
+            return None
+        lat, lon = float(dec[0]), float(dec[1])
+    dom = [v for v in ints if 1 <= v <= 31]
+    elev = [v for v in ints if v >= 300]
+    if len(dom) != 1 or len(dom) + len(elev) != len(ints) or len(elev) > 3:
+        return None
+    if any(not (MT_ELEV_RANGE[0] <= e <= MT_ELEV_RANGE[1]) for e in elev):
+        return None
+    return lat, lon, dom[0], elev
+
 CMD_RE = re.compile(r"(?i)(?<![a-z])(wx|wv)\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
 GPS_RE = re.compile(r"(?i)\blat(?:itude)?[:\s]+(-?\d{1,2}\.\d+)[^\d-]+lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+)")
 LINK_RE = re.compile(r"https://(?:inreachlink\.com/[A-Za-z0-9_-]+|[^\s\"'<>]*garmin\.com/textmessage/txtmsg\?"
@@ -328,12 +537,29 @@ def message_text(msg):
     return re.sub(r"<[^>]+>", " ", "\n".join(html)).replace("&amp;", "&")
 
 def parse_request(text):
-    """-> (lat, lon, kind) with kind 'wx' (wind) or 'wv' (waves) | 'gps-missing' | None."""
+    """-> (lat, lon, kind) with kind 'wx' (wind) or 'wv' (waves) | (lat, lon, 'mt', day, elevs)
+    | 'gps-missing' | 'mt-help' | None."""
     # Only the user's own message: Garmin appends the reply link and GPS line below it.
     head = re.split(r"(?i)view the location|send a reply|sent this message from", text)[0]
     head = head.replace("\u2212", "-").replace("\u2013", "-").replace("\u00b0", "")  # phone/Mac auto-typography
     head = re.sub(r"(\d)\.\s+(\d)", r"\1.\2", head)            # inReach keyboard: "49. 36" -> "49.36"
     m = CMD_RE.search(head)
+    mm = MT_RE.search(head)
+    if mm and (not m or mm.start() < m.start()):
+        a = parse_mt_args(mm.group(1))
+        if a is None:
+            return "mt-help"
+        lat, lon, dom, elev = a
+        if lat is None:
+            g = GPS_RE.search(text)
+            if not g:
+                return "gps-missing"
+            lat, lon = float(g.group(1)), float(g.group(2))
+        if lon > 0:
+            lon = -lon
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return "mt-help"
+        return lat, lon, "mt", dom, elev
     if not m:
         return None
     kind = m.group(1).lower()
@@ -434,7 +660,11 @@ def handle(msg, fc_loader, allowed):
         return ([HELP] if link else None), link, sender
     if req == "gps-missing":
         return [HELP], link, sender
-    lat, lon, kind = req
+    if req == "mt-help":
+        return [MT_HELP], link, sender
+    lat, lon, kind = req[:3]
+    if kind == "mt":
+        return build_mt_reply(fc_loader("mt"), lat, lon, req[3], req[4]), link, sender
     if kind == "wv":
         return build_wave_reply(fc_loader("wv"), lat, lon), link, sender
     return build_reply(fc_loader(), lat, lon), link, sender
@@ -503,6 +733,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--point", nargs=2, type=float, metavar=("LAT", "LON"))
     ap.add_argument("--waves", action="store_true", help="with --point: the wv (waves) reply")
+    ap.add_argument("--mt", type=int, metavar="DAY", help="with --point: the mt (mountain) reply for that day of month")
+    ap.add_argument("--elev", type=int, nargs="*", metavar="M", help="with --mt: elevations in metres")
     ap.add_argument("--eml", help="process one saved .eml file instead of the inbox")
     ap.add_argument("--dry-run", action="store_true", help="print replies, send nothing, mark nothing read")
     ap.add_argument("--inspect", action="store_true",
@@ -514,9 +746,12 @@ def main():
     fc_cache = {}
     def fc_loader(kind="wx"):
         if kind not in fc_cache:
-            fc_cache[kind] = Waves() if kind == "wv" else Forecasts()
+            fc_cache[kind] = Waves() if kind == "wv" else Mountain() if kind == "mt" else Forecasts()
         return fc_cache[kind]
 
+    if args.point and args.mt:
+        print("\n---\n".join(build_mt_reply(fc_loader("mt"), *args.point, args.mt, args.elev)))
+        return
     if args.point:
         fn = build_wave_reply if args.waves else build_reply
         print("\n---\n".join(fn(fc_loader("wv" if args.waves else "wx"), *args.point)))

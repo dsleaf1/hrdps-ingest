@@ -1,0 +1,40 @@
+name: HRDPS mountain (inReach mt)
+
+on:
+  schedule:
+    - cron: "25 5,11,17,23 * * *"    # after the wind ingest; HRDPS 00/06/12/18Z are complete ~5 h later
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = bake + upload ; test = unit tests + 4 steps, no upload"
+        type: choice
+        options: [full, test]
+        default: test
+  push:                              # smoke test (never uploads) when the bake changes on a feature branch
+    branches: ["mt-*"]
+    paths: ["mountain.py", "test_mt.py", ".github/workflows/mountain.yml"]
+
+concurrency:
+  group: hrdps-mountain-${{ github.event_name }}
+  cancel-in-progress: false
+
+jobs:
+  bake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y libeccodes0 libeccodes-dev
+      - run: pip install -r requirements.txt
+      - name: Unit tests
+        run: python test_mt.py
+      - name: Bake
+        env:
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+        run: python mountain.py ${{ (github.event_name != 'schedule' && github.event.inputs.mode != 'full') && '--no-upload --max-steps 4' || '' }}
