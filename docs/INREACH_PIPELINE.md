@@ -384,7 +384,7 @@ The Apps Script stores its GitHub token in its own **Script Properties** as `GIT
 
 ## 11. Mountain forecasts (`mt`)
 
-`mt` answers a climber's question for **one day**: how windy is it at my elevations, where is the freezing level, and will it precipitate?
+`mt` answers a climber's question for **one day**: how windy and how cold is it at my elevations, where is the freezing level, and will it precipitate?
 
 ### 11.1 Sending
 
@@ -393,6 +393,7 @@ The Apps Script stores its GitHub token in its own **Script Properties** as `GIT
 | `mt 17` | The 17th, at the inReach's own GPS position, at 2000 m and 3000 m |
 | `mt 51.23 -123.90 17` | The 17th at another point. Coordinates must have a decimal point; the minus on longitude is optional |
 | `mt 17 2500 3500` | Choose up to three elevations, each 500 to 4500 m |
+| `mt 17 F` | Temperatures in Fahrenheit. Celsius is the default; the letter can go anywhere after `mt` |
 
 The **day of the month is required**. The bot tells the numbers apart by their form: two decimals first are coordinates, a whole number from 1 to 31 is the day, and whole numbers from 300 up are elevations.
 
@@ -403,12 +404,17 @@ HRDPS reaches 48 hours, so only **today and tomorrow** can be served. Any other 
 ```
 51.23,-123.90 18Z
 Tu17 FZmax1250
-2000/3000m
+2000/3000m C
 04 SW14/SSW12 0
+-9/-15
 08 SW9/S3 0
+-7/-14
 12 C/E11 0
+-6/-12
 16 E7/E15 T
+-6/-12
 20 E14/E18 3
+-7/-14
 ```
 
 | Part | Meaning |
@@ -416,24 +422,40 @@ Tu17 FZmax1250
 | Line 1 | The point and the HRDPS run (UTC), the same as a `wx` header |
 | `Tu17` | The day the forecast is for |
 | `FZmax1250` | The highest freezing level that day, in metres, to the nearest 50. `0` = below freezing all the way down; `>4500` = above the model levels used |
-| `2000/3000m` | The elevations, in the order used on every slot line |
-| `gnd1760` | Follows the elevations only when one you asked for is below the model's terrain at that cell |
+| `2000/3000m C` | The elevations, in the order used on every slot line, then the temperature unit (`C` or `F`) |
+| `gnd1760` | Follows the elevations only when one you asked for is below the model's terrain at that cell; on its own line if line 3 would pass 20 characters |
 | `04` … `20` | Local hour of the slot |
 | `SW14/SSW12` | Wind **from** the SW at 14 km/h at the first elevation, from the SSW at 12 km/h at the second. `C` = calm (under 3 km/h) |
 | last number | Precipitation in mm over the 4 hours ending at that slot. `T` = trace (under 0.5 mm) |
+| `-9/-15` | The line under each slot: temperature at each elevation at that hour, in whole degrees |
 | `-` | No data: beyond the run, or that elevation is below the model's terrain |
 
-For **today's** date the reply starts at the most recent slot and continues with those still ahead, and the freezing-level maximum covers only that remaining part of the day.
+**Three elevations:** a temperature line under every slot will not fit in one message, so the header gains two lines instead and the slots carry wind and precipitation only:
+
+```
+51.23,-123.90 18Z
+Tu17 FZmax1200
+1500/2500/3500m C
+gnd1760
+Lo -/-12/-19
+Hi -/-8/-15
+04 -/SW20/SW28 0
+...
+```
+
+`Lo` and `Hi` are the day's lowest and highest temperature at each elevation, from the samples at 04, 08, 12, 14, 16 and 20.
+
+For **today's** date the reply starts at the most recent slot and continues with those still ahead, and the freezing-level maximum (and `Lo`/`Hi`) cover only that remaining part of the day.
 
 Things to keep in mind:
 
 - **Units are km/h**, not knots as in `wx`.
-- Winds are the model's value at one instant (the slot hour), not a 3-hour summary.
+- Winds and temperatures are the model's value at one instant (the slot hour), not a 3-hour summary. An overnight low before 04:00 is not captured.
 - The model's terrain is smoothed to 2.5 km, so real summits stand above it and real valleys lie below it. Wind at 3000 m over a 3000 m summit is closer to free-air wind than to what you will feel in the lee of the ridge.
 - Precipitation is a forecast **amount**, not a probability, and is liquid-equivalent: multiply by roughly 10 for centimetres of snow.
 - Slot hours are **British Columbia time**, which stays on UTC-7 all year from 2026. In Washington in winter the slots are therefore one hour earlier on the local clock (`04` is 03:00 PST).
 - The header is split over three short lines because an inReach screen wraps a line at about 20 characters.
-- If a slot line would pass 20 characters, or the reply would exceed 160 (three elevations with strong winds and heavy precipitation), the bot shortens compass names to eight points (`SW` instead of `WSW`). If the reply is still over 160 it drops the latest slots.
+- If a slot line would pass 20 characters, or the reply would exceed 160, the bot shortens compass names to eight points (`SW` instead of `WSW`). If the reply is still over 160 it drops the latest slots, together with their temperature lines. A typical two-elevation reply is 145 to 156 characters; three elevations usually lose the 20:00 slot.
 
 ### 11.3 Preparing the data (`mountain.py`)
 
@@ -445,7 +467,7 @@ Things to keep in mind:
 
 1. **Find the newest complete run**: one whose hour-48 folder already holds the wind, temperature and precipitation files.
 2. **Pick the hours to bake**: every local 04, 08, 12, 16 and 20 the run covers, plus 14:00 for temperature only. That is about 12 time steps instead of 49, which keeps the download near 500 MB per run.
-3. **Wind at fixed heights.** Pressure levels drift up and down with the weather, so each level's own height is used to interpolate the wind to 500, 1000, … 4500 m above sea level. The interpolation is done on the east and north components, so a wind swinging through north is handled correctly.
+3. **Wind and temperature at fixed heights.** Pressure levels drift up and down with the weather, so each level's own height is used to interpolate the wind and temperature to 500, 1000, … 4500 m above sea level. Wind is interpolated on its east and north components, so a wind swinging through north is handled correctly. Temperature comes from the same files used for the freezing level, so it adds nothing to the download.
 4. **Freezing level**: the highest point in the column where the temperature crosses 0 °C. With a temperature inversion there can be several crossings; the highest is the one that decides rain or snow up high.
 5. **Precipitation**: the accumulated total at the slot minus the total 4 hours earlier.
 6. **Pack and upload** to R2 under `mt/`.
@@ -455,7 +477,8 @@ Things to keep in mind:
 Unlike the wind and wave files, the mountain file is **not compressed and is ordered cell by cell**. Everything about one cell sits together in one short record, so the bot fetches just that record with a single HTTP Range request instead of downloading the region.
 
 ```
-record  = [terrain] + for each step: ( [speed][direction] for each of the 9 heights ) + [freezing level] + [precip]
+record  = [terrain] + for each step: ( [speed][direction] for each of the 9 heights )
+                                     + ( [temperature] for each of the 9 heights ) + [freezing level] + [precip]
 offset  = cell_index × record_len          cell_index = row × cols + col, row 0 = north
 ```
 
@@ -464,11 +487,12 @@ offset  = cell_index × record_len          cell_index = row × cols + col, row 
 | terrain | × 20 = metres |
 | speed | km/h |
 | direction | × 360 / 255 = degrees the wind blows from |
+| temperature | ÷ 2 − 60 = °C, half-degree steps from −60 to +67 °C |
 | freezing level | × 20 = metres; 254 = above the top level |
 | precip | 0–100 = tenths of a mm; 101–254 = that value minus 90, in whole mm |
 | 255 | no data, in every field |
 
-The file is named by run hour (`coast-overview.18.bin`) and the manifest (`mt/manifest.json`) names the file to read, lists the steps in UTC and in local time, and gives `record_len`. Because the manifest is uploaded last and each run writes a differently named file, the bot never reads a file that is half replaced.
+The file is named by run hour (`coast-overview.18.bin`) and the manifest (`mt/manifest.json`) names the file to read, lists the steps in UTC and in local time, and gives `step_len` and `record_len`. The bot reads both layouts: 29 bytes per step with temperatures, or 20 bytes per step from a bake made before temperatures were added, in which case the reply simply has no temperature lines. Because the manifest is uploaded last and each run writes a differently named file, the bot never reads a file that is half replaced.
 
 For an elevation between two stored heights, the bot interpolates between them, again on the wind components.
 

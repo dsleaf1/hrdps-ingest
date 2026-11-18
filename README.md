@@ -137,8 +137,9 @@ current slot on; it is skipped only once 18:00 has passed.
 
 **Mountain forecast (`mt`)**: `mt 17` (GPS fix) or `mt 51.23 -123.90 17`, optionally followed by up
 to three elevations in metres (`mt 17 2500 3500`; default 2000 and 3000). The day of the month is
-required. The reply covers that one day: wind aloft in km/h at each elevation, the day's highest
-freezing level, and precipitation in the 4 hours before each of the local slots **04 08 12 16 20**.
+required. The reply covers that one day: wind and temperature aloft at each elevation, the day's
+highest freezing level, and precipitation in the 4 hours before each of the local slots
+**04 08 12 16 20**. Temperatures are Celsius unless the request includes `F` (`mt 17 F`).
 Baked by `mountain.py` (`.github/workflows/mountain.yml`) for `coast-overview` only; see
 [`docs/INREACH_PIPELINE.md`](docs/INREACH_PIPELINE.md) section 11. Tests: `python test_mt.py`.
 
