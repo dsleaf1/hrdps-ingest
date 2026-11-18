@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-HRDPS mountain bake for the inReach bot's `mt` command: wind aloft, freezing level, precipitation.
+HRDPS mountain bake for the inReach bot's `mt` command: wind and temperature aloft, freezing level,
+precipitation.
 
 Source: ECCC HRDPS Continental 2.5 km on the MSC Datamart (the same runs ingest.py uses), fields on
 pressure levels 1000..550 hPa:
@@ -10,18 +11,21 @@ pressure levels 1000..550 hPa:
 plus APCP_Sfc (precipitation accumulated since the run started, mm) and HGT_Sfc (model terrain, m).
 
 Only the hours the bot reports are baked: local 04 08 12 16 20 for every day the run reaches, plus a
-14:00 temperature-only sample so the daily freezing-level maximum catches the afternoon peak.
+14:00 temperature-only sample so the daily freezing-level maximum and temperature high catch the
+afternoon peak.
 
 Per time step, per cell:
   wind at fixed heights 500..4500 m ASL (every 500 m), linearly interpolated between pressure
       levels using each level's own height. Values are kept even where a height is below the model
       terrain (the model extrapolates underground); the bot refuses those using the terrain byte.
+  temperature at the same fixed heights, interpolated the same way (every step, 14:00 included).
   freezing level: the HIGHEST 0 C crossing in the column (m ASL). 0 = whole column below freezing.
   precipitation: mm in the 4 hours ending at the step.
 
 Output (R2, prefix mt/): manifest.json + {region}.{run hour}.bin, UNCOMPRESSED and cell-major so
 the bot reads one cell with a single HTTP Range request:
-  record = [terrain] + for each step: ([speed, dir] for each height) + [freezing level] + [precip]
+  record = [terrain] + for each step: ([speed, dir] for each height) + (temp for each height)
+                                      + [freezing level] + [precip]
   cell offset = cell_index * record_len      (cell_index = row * cols + col, row 0 = north)
 Byte encodings are in the manifest ("encoding"). 255 = no data everywhere.
 
@@ -44,6 +48,8 @@ FZ_EXTRA = (14,)                        # local hours baked for freezing level o
 PRECIP_H = 4                            # precipitation is the total over this many hours before a slot
 MAX_FHOUR = 48
 TERRAIN_M, FZ_M = 20, 20                # metres per byte step
+TEMP_OFFSET = 60                        # temperature byte = (deg C + 60) * 2
+STEP_LEN = 3 * len(HEIGHTS) + 2         # per step: (speed, dir) and temp per height, freezing level, precip
 FZ_ABOVE = 254                          # freezing level above the top pressure level
 PREFIX = "mt"
 
@@ -85,6 +91,20 @@ def to_heights(H, spd, wdir, heights=HEIGHTS):
     direction = np.degrees(np.arctan2(-us, -vs)) % 360
     return speed, direction
 
+def interp_heights(H, X, heights=HEIGHTS):
+    """A scalar on pressure levels -> the same scalar at fixed heights, linear in height.
+    H, X: arrays [level, cell], levels low -> high. -> [height, cell]; NaN outside the column."""
+    n = H.shape[1]
+    out = np.full((len(heights), n), np.nan, "float32")
+    for k, z in enumerate(heights):
+        for l in range(H.shape[0] - 1):
+            lo, hi = H[l], H[l + 1]
+            m = (lo <= z) & (z <= hi) & (hi > lo)
+            if m.any():
+                w = (z - lo[m]) / (hi[m] - lo[m])
+                out[k, m] = X[l][m] * (1 - w) + X[l + 1][m] * w
+    return out
+
 def freezing_level(H, T):
     """Highest 0 C crossing. H [level, cell] in m, T [level, cell] in deg C, levels low -> high.
     -> metres; 0 where the whole column is below freezing; +inf where it is above freezing all the
@@ -119,9 +139,14 @@ def enc_wind(speed_kmh, direction):
     d = np.where(np.isfinite(direction), np.round((direction % 360) * 255.0 / 360.0) % 255, 0).astype("uint8")
     return s, d
 
+def enc_temp(c):
+    """deg C -> (C + 60) * 2, i.e. half degrees from -60 to +67 C; 255 = no data."""
+    c = np.asarray(c, "float32")
+    return np.where(np.isfinite(c), np.clip(np.round((c + TEMP_OFFSET) * 2), 0, 254), 255).astype("uint8")
+
 def step_columns(H, T, spd, wdir, precip_mm):
     """One time step's byte columns for a region, in record order. spd/wdir None = freezing-level-only
-    step (wind bytes 255). precip_mm None = no precipitation for this step."""
+    step (wind bytes 255; temperatures are still written). precip_mm None = no precipitation."""
     n = H.shape[1]
     cols = []
     if spd is None:
@@ -130,6 +155,8 @@ def step_columns(H, T, spd, wdir, precip_mm):
         s, d = to_heights(H, spd * 3.6, wdir)
         for k in range(len(HEIGHTS)):
             cols += list(enc_wind(s[k], d[k]))
+    tc = interp_heights(H, T)
+    cols += [enc_temp(tc[k]) for k in range(len(HEIGHTS))]
     fz = freezing_level(H, T)
     fzb = enc_scaled(np.where(np.isinf(fz), np.nan, fz), FZ_M)
     fzb[np.isinf(fz)] = FZ_ABOVE
@@ -246,7 +273,7 @@ def main():
     if not times or not any(has_wind):
         raise RuntimeError("no wind steps ingested")
 
-    step_len = 2 * len(HEIGHTS) + 2
+    step_len = STEP_LEN
     rec_len = 1 + len(times) * step_len
     blobs = {}
     for k in REGIONS:
@@ -257,11 +284,14 @@ def main():
         i = next(j for j, w in enumerate(has_wind) if w)
         k2000 = HEIGHTS.index(2000)
         sp = rec[:, 1 + i * step_len + 2 * k2000]
-        fz = rec[:, 1 + i * step_len + 2 * len(HEIGHTS)]
+        tt = rec[:, 1 + i * step_len + 2 * len(HEIGHTS) + k2000]
+        fz = rec[:, 1 + i * step_len + 3 * len(HEIGHTS)]
         ok = sp[sp != 255]
+        tok = tt[tt != 255] / 2.0 - TEMP_OFFSET
         msg = (f"{k}: {len(times)} steps, record {rec_len} B, file {len(blobs[k]) / 1e6:.1f} MB, terrain max "
                f"{int(tb[tb != 255].max()) * TERRAIN_M} m, first step 2000 m wind mean "
-               f"{ok.mean() if ok.size else float('nan'):.0f} max {ok.max() if ok.size else 0} km/h, "
+               f"{ok.mean() if ok.size else float('nan'):.0f} max {ok.max() if ok.size else 0} km/h, 2000 m temp "
+               f"{tok.min() if tok.size else float('nan'):.0f} to {tok.max() if tok.size else float('nan'):.0f} C, "
                f"freezing level median {float(np.median(fz[fz < FZ_ABOVE])) * FZ_M if (fz < FZ_ABOVE).any() else float('nan'):.0f} m, "
                f"downloaded {R.bytes / 1e6:.0f} MB")
         log(msg)
@@ -280,8 +310,9 @@ def main():
                         .astimezone(ZoneInfo(TZ)).strftime("%Y-%m-%dT%H") for t in times], "heights_m": HEIGHTS, "levels_hpa": LEVELS,
         "precip_hours": PRECIP_H, "nodata": 255, "step_len": step_len, "record_len": rec_len,
         "encoding": {
-            "record": "terrain, then per step: (speed, dir) per height, freezing level, precip",
+            "record": "terrain, then per step: (speed, dir) per height, temp per height, freezing level, precip",
             "terrain": f"m ASL / {TERRAIN_M}", "speed": "km/h", "dir": "from, 0..360 -> 0..255",
+            "temp": f"deg C = byte / 2 - {TEMP_OFFSET}",
             "freezing_level": f"m ASL / {FZ_M}; {FZ_ABOVE} = above the {LEVELS[-1]} hPa level",
             "precip": "0-100 tenths of mm; 101-254 = whole mm + 90",
         },

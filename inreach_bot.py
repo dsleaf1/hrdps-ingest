@@ -16,24 +16,33 @@ REPLY (one message, <= 160 chars):
     - SE15G25 = wind FROM the SE at 15 kt, gusting 25 kt;  C = calm (< 3 kt)
     - "-" = a slot already past (today) or beyond the run's 48 h (last day); positions stay fixed
 
-MOUNTAIN REQUEST (wind aloft, freezing level, precipitation for ONE day; the day is required):
+MOUNTAIN REQUEST (wind and temperature aloft, freezing level, precipitation for ONE day; the day
+is required):
     mt 17                   day of the month, at the inReach's own GPS fix, 2000 and 3000 m
     mt 51.23 -123.90 17     another point (coordinates need a decimal point)
     mt 17 2500 3500         choose up to three elevations, 500-4500 m
+    mt 17 F                 temperatures in Fahrenheit (Celsius is the default)
 
 MOUNTAIN REPLY (one message, <= 160 chars):
     51.23,-123.90 18Z
     Tu17 FZmax1250
-    2000/3000m
+    2000/3000m C
     04 SW14/SSW12 0
+    -9/-15
     08 SW9/S3 0
+    -7/-13
     ...
     - line 1: the point and the HRDPS run (UTC), as for wx
     - line 2: the day, then that day's highest freezing level (m)
-    - line 3: the elevations (plus gndNNNN = model terrain, when one of them is below it)
+    - line 3: the elevations and the temperature unit (plus gndNNNN = model terrain, when one of
+      the elevations is below it; on its own line if line 3 would pass 20 characters)
     - no line is meant to pass 20 characters, where an inReach screen wraps
     - each slot: local hour, wind FROM / km/h at each elevation, then mm of precipitation in the
-      4 hours before it (T = trace, under 0.5 mm);  C = calm;  - = no data / below model terrain
+      4 hours before it (T = trace, under 0.5 mm);  C = calm;  - = no data / below model terrain;
+      the next line holds the temperature at each elevation, in whole degrees
+    - with three elevations the per-slot temperature lines do not fit, so the header gains two
+      lines instead: Lo and Hi, the day's lowest and highest temperature at each elevation
+    - if the reply is still too long: 8-point compass first, then the latest slots are dropped
     - today's date gives the most recent slot and those still ahead
 
 DATA: reads the same Cloudflare R2 files the Salish marine map reads (hrdps/manifest.json +
@@ -84,7 +93,7 @@ DAYS = ["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]
 HELP = ("Send: wx LAT LON wind, wv LAT LON waves, mt LAT LON DAY mountain. "
         "e.g. wx 49.36 -125.72 or mt 51.23 -123.90 17. No LAT LON = your GPS spot")
 MT_HELP = ("mt needs the day of month: mt 17 (your GPS spot) or mt 51.23 -123.90 17. "
-           "Optional elevations 500-4500 m: mt 17 2500 3500")
+           "Optional elevations 500-4500 m: mt 17 2500 3500. Add F for Fahrenheit")
 
 def log(*a): print(*a, file=sys.stderr, flush=True)
 
@@ -365,8 +374,12 @@ class Mountain:
                             for i, s in enumerate(self.man["steps_local"])}
         self.heights = self.man["heights_m"]
         self.step_len, self.rec_len = self.man["step_len"], self.man["record_len"]
-        if self.step_len != 2 * len(self.heights) + 2 or self.rec_len != 1 + len(self.man["steps"]) * self.step_len:
+        nh = len(self.heights)
+        # 3h+2 = with temperatures (current bake); 2h+2 = an older bake without them, still readable
+        if self.step_len not in (2 * nh + 2, 3 * nh + 2) or self.rec_len != 1 + len(self.man["steps"]) * self.step_len:
             raise RuntimeError("mt manifest: record layout does not match heights/steps")
+        self.has_temp = self.step_len == 3 * nh + 2
+        self.fz_off = (3 if self.has_temp else 2) * nh       # freezing level, then precip, after these
 
     def record(self, lat, lon):
         """-> MtCell for the nearest 2.5 km cell, or None outside every region."""
@@ -414,14 +427,34 @@ class MtCell:
             return None
         return math.hypot(*uv), math.degrees(math.atan2(-uv[0], -uv[1])) % 360
 
+    def _temp_level(self, i, k):
+        b = self.rec[1 + i * self.mt.step_len + 2 * len(self.mt.heights) + k]
+        return None if b == 255 else b / 2.0 - 60
+
+    def temp(self, i, elev):
+        """deg C at `elev` m for step i, linear between the 500 m heights; None if the bake has no
+        temperatures, there is no data, or the elevation is below the model's terrain."""
+        hs = self.mt.heights
+        if not self.mt.has_temp or (self.terrain is not None and elev < self.terrain) or not hs[0] <= elev <= hs[-1]:
+            return None
+        k = max(j for j, h in enumerate(hs) if h <= elev)
+        lo = self._temp_level(i, k)
+        if hs[k] == elev:
+            return lo
+        hi = self._temp_level(i, k + 1)
+        if lo is None or hi is None:
+            return None
+        w = (elev - hs[k]) / (hs[k + 1] - hs[k])
+        return lo * (1 - w) + hi * w
+
     def freezing(self, i):
         """Freezing level in m; math.inf = above the model's top level; None = no data."""
-        b = self.rec[1 + i * self.mt.step_len + 2 * len(self.mt.heights)]
+        b = self.rec[1 + i * self.mt.step_len + self.mt.fz_off]
         return None if b == 255 else math.inf if b == 254 else b * 20
 
     def precip(self, i):
         """mm in the hours before step i (manifest precip_hours), or None."""
-        b = self.rec[1 + i * self.mt.step_len + 2 * len(self.mt.heights) + 1]
+        b = self.rec[1 + i * self.mt.step_len + self.mt.fz_off + 1]
         return None if b == 255 else b / 10 if b <= 100 else b - 90
 
 def mt_wind_code(w, points=16):
@@ -432,6 +465,12 @@ def mt_wind_code(w, points=16):
         return "C"
     names = COMPASS if points == 16 else COMPASS8
     return f"{names[round(w[1] / (360 / len(names))) % len(names)]}{k}"
+
+def mt_temp_code(c, unit="C"):
+    """Whole degrees in `unit`; '-' = no data."""
+    if c is None:
+        return "-"
+    return str(math.floor((c * 9 / 5 + 32 if unit == "F" else c) + 0.5))
 
 def mt_precip_code(mm):
     if mm is None:
@@ -454,8 +493,8 @@ def mt_day_plan(mt, day, now):
         return None
     return [(h, i) for h, t, i in slots]
 
-def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None):
-    """Mountain reply for day-of-month `dom`: one message string in a list."""
+def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None, unit="C"):
+    """Mountain reply for day-of-month `dom`: one message string in a list. `unit` = 'C' or 'F'."""
     elevs = list(elevs or MT_DEFAULT_ELEV)
     cellrec = mt.record(lat, lon)
     if cellrec is None:
@@ -471,40 +510,64 @@ def build_mt_reply(mt, lat, lon, dom, elevs=None, now=None):
                 else "No mt forecast available right now, try again in an hour"]
     plan = plans[day]
 
-    # freezing-level maximum: every baked sample of that day from the first reported slot on
-    fz = [cellrec.freezing(i) for (d, h), i in mt.local_index.items() if d == day and h >= plan[0][0]]
-    fz = [x for x in fz if x is not None]
+    # daily figures: every baked sample of that day from the first reported slot on (14:00 included)
+    samples = [i for (d, h), i in mt.local_index.items() if d == day and h >= plan[0][0]]
+    fz = [x for x in (cellrec.freezing(i) for i in samples) if x is not None]
     fzmax = "-" if not fz else ">4500" if max(fz) == math.inf else str(int(round(max(fz) / 50.0)) * 50)
-    line3 = "/".join(str(e) for e in elevs) + "m"
-    if cellrec.terrain is not None and any(e < cellrec.terrain for e in elevs):
-        line3 += f" gnd{cellrec.terrain}"
-    # three short header lines: an inReach screen wraps at about 20 characters
-    header = f"{lat:.2f},{lon:.2f} {mt.run:%H}Z\n{label(day)} FZmax{fzmax}\n{line3}"
 
-    def lines(points):
+    # header: three short lines, as an inReach screen wraps at about 20 characters
+    head = [f"{lat:.2f},{lon:.2f} {mt.run:%H}Z", f"{label(day)} FZmax{fzmax}"]
+    line3 = "/".join(str(e) for e in elevs) + "m" + (f" {unit}" if mt.has_temp else "")
+    gnd = f"gnd{cellrec.terrain}" if cellrec.terrain is not None and any(e < cellrec.terrain for e in elevs) else ""
+    if gnd and len(line3) + 1 + len(gnd) <= MT_LINE:
+        head.append(f"{line3} {gnd}")
+    else:
+        head += [line3] + ([gnd] if gnd else [])
+    per_slot_temp = mt.has_temp and len(elevs) <= 2
+    if mt.has_temp and not per_slot_temp:                   # three elevations: the day's low and high
+        for name, pick in (("Lo", min), ("Hi", max)):
+            vals = []
+            for e in elevs:
+                ts = [x for x in (cellrec.temp(i, e) for i in samples) if x is not None]
+                vals.append(mt_temp_code(pick(ts) if ts else None, unit))
+            head.append(f"{name} " + "/".join(vals))
+    header = "\n".join(head)
+
+    def blocks(points):
+        """One block per slot: the wind line, then (two elevations or fewer) its temperature line."""
         out = []
         for h, i in plan:
             if i is None:
-                out.append(f"{h:02d} -")
-            else:
-                out.append(f"{h:02d} " + "/".join(mt_wind_code(cellrec.wind(i, e), points) for e in elevs)
-                           + " " + mt_precip_code(cellrec.precip(i)))
+                out.append([f"{h:02d} -"])
+                continue
+            blk = [f"{h:02d} " + "/".join(mt_wind_code(cellrec.wind(i, e), points) for e in elevs)
+                   + " " + mt_precip_code(cellrec.precip(i))]
+            if per_slot_temp:
+                blk.append("/".join(mt_temp_code(cellrec.temp(i, e), unit) for e in elevs))
+            out.append(blk)
         return out
-    body = lines(16)
-    if len(header) + sum(len(l) + 1 for l in body) > MAX_LEN or any(len(l) > MT_LINE for l in body):
-        body = lines(8)                                    # shorter compass names first
-    while len(body) > 1 and len(header) + sum(len(l) + 1 for l in body) > MAX_LEN:
+    size = lambda body: len(header) + sum(len(l) + 1 for b in body for l in b)
+    body = blocks(16)
+    if size(body) > MAX_LEN or any(len(l) > MT_LINE for b in body for l in b):
+        body = blocks(8)                                   # shorter compass names first
+    while len(body) > 1 and size(body) > MAX_LEN:
         body.pop()                                         # then drop the latest slot
-    return ["\n".join([header] + body)]
+    return ["\n".join([header] + [l for b in body for l in b])]
 
 # ---------------------------------------------------------------- parsing requests
 MT_RE = re.compile(r"(?i)(?<![a-z])mt(?![a-z])([^\n]*)")     # also "mt17"
 
 def parse_mt_args(s):
-    """'51.23 -123.90 17 2500 3500' -> (lat or None, lon or None, day, [elevations]) | None if unreadable.
-    Numbers are told apart by form: two decimals first = coordinates, a whole number 1-31 = day of
-    month, whole numbers from 300 up = elevations in metres (500-4500 accepted)."""
+    """'51.23 -123.90 17 2500 3500 F' -> (lat or None, lon or None, day, [elevations], 'C' or 'F')
+    | None if unreadable. Numbers are told apart by form: two decimals first = coordinates, a whole
+    number 1-31 = day of month, whole numbers from 300 up = elevations in metres (500-4500 accepted).
+    A lone letter C or F picks the temperature unit; Celsius when absent."""
     s = re.sub(r"(?i)(?<=\d)\s*[mnw]\b", " ", s[:70])        # 2500m, 51.23N, 123.9W
+    units = {u.upper() for u in re.findall(r"(?i)(?<![a-z])([cf])(?![a-z])", s)}
+    if len(units) > 1:
+        return None
+    unit = units.pop() if units else "C"
+    s = re.sub(r"(?i)(?<![a-z])[cf](?![a-z])", " ", s)
     s = re.sub(r"(?<=\d)-(?=\d)", " ", s.replace(",", " ").replace("/", " "))   # 2500-3500, 2500/3500
     toks = re.findall(r"-?\d+(?:\.\d+)?", s)
     dec = [t for t in toks if "." in t]
@@ -520,7 +583,7 @@ def parse_mt_args(s):
         return None
     if any(not (MT_ELEV_RANGE[0] <= e <= MT_ELEV_RANGE[1]) for e in elev):
         return None
-    return lat, lon, dom[0], elev
+    return lat, lon, dom[0], elev, unit
 
 CMD_RE = re.compile(r"(?i)(?<![a-z])(wx|wv)\b[\s:]*(?:(-?\d{1,2}(?:\.\d+)?)\s*[ns]?\s*[, ]\s*(-?\d{1,3}(?:\.\d+)?)\s*[ew]?\b)?")
 GPS_RE = re.compile(r"(?i)\blat(?:itude)?[:\s]+(-?\d{1,2}\.\d+)[^\d-]+lon(?:gitude)?[:\s]+(-?\d{1,3}\.\d+)")
@@ -543,7 +606,7 @@ def message_text(msg):
     return re.sub(r"<[^>]+>", " ", "\n".join(html)).replace("&amp;", "&")
 
 def parse_request(text):
-    """-> (lat, lon, kind) with kind 'wx' (wind) or 'wv' (waves) | (lat, lon, 'mt', day, elevs)
+    """-> (lat, lon, kind) with kind 'wx' (wind) or 'wv' (waves) | (lat, lon, 'mt', day, elevs, unit)
     | 'gps-missing' | 'mt-help' | None."""
     # Only the user's own message: Garmin appends the reply link and GPS line below it.
     head = re.split(r"(?i)view the location|send a reply|sent this message from", text)[0]
@@ -555,7 +618,7 @@ def parse_request(text):
         a = parse_mt_args(mm.group(1))
         if a is None:
             return "mt-help"
-        lat, lon, dom, elev = a
+        lat, lon, dom, elev, unit = a
         if lat is None:
             g = GPS_RE.search(text)
             if not g:
@@ -565,7 +628,7 @@ def parse_request(text):
             lon = -lon
         if not (-90 <= lat <= 90 and -180 <= lon <= 180):
             return "mt-help"
-        return lat, lon, "mt", dom, elev
+        return lat, lon, "mt", dom, elev, unit
     if not m:
         return None
     kind = m.group(1).lower()
@@ -670,7 +733,7 @@ def handle(msg, fc_loader, allowed):
         return [MT_HELP], link, sender
     lat, lon, kind = req[:3]
     if kind == "mt":
-        return build_mt_reply(fc_loader("mt"), lat, lon, req[3], req[4]), link, sender
+        return build_mt_reply(fc_loader("mt"), lat, lon, req[3], req[4], unit=req[5]), link, sender
     if kind == "wv":
         return build_wave_reply(fc_loader("wv"), lat, lon), link, sender
     return build_reply(fc_loader(), lat, lon), link, sender
@@ -741,6 +804,7 @@ def main():
     ap.add_argument("--waves", action="store_true", help="with --point: the wv (waves) reply")
     ap.add_argument("--mt", type=int, metavar="DAY", help="with --point: the mt (mountain) reply for that day of month")
     ap.add_argument("--elev", type=int, nargs="*", metavar="M", help="with --mt: elevations in metres")
+    ap.add_argument("--unit", choices=["C", "F"], default="C", help="with --mt: temperature unit")
     ap.add_argument("--eml", help="process one saved .eml file instead of the inbox")
     ap.add_argument("--dry-run", action="store_true", help="print replies, send nothing, mark nothing read")
     ap.add_argument("--inspect", action="store_true",
@@ -756,7 +820,7 @@ def main():
         return fc_cache[kind]
 
     if args.point and args.mt:
-        print("\n---\n".join(build_mt_reply(fc_loader("mt"), *args.point, args.mt, args.elev)))
+        print("\n---\n".join(build_mt_reply(fc_loader("mt"), *args.point, args.mt, args.elev, unit=args.unit)))
         return
     if args.point:
         fn = build_wave_reply if args.waves else build_reply

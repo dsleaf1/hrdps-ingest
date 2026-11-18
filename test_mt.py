@@ -52,6 +52,15 @@ check("freezing: inversion takes the highest crossing", abs(fz[1] - 1600) < 1, s
 check("freezing: whole column frozen -> 0", fz[2] == 0)
 check("freezing: whole column warm -> above top", np.isinf(fz[3]))
 
+t = M.interp_heights(H, np.array([[5.0], [-1.0], [-8.0]]), [1500, 2000, 2500, 3500])
+check("temperature: linear between levels, NaN above the top", np.allclose(t[:3, 0], [2, -1, -4.5]) and np.isnan(t[3, 0]), str(t))
+tb = M.enc_temp(np.array([-60, -15.6, -0.2, 0, 21.3, 80, np.nan]))
+check("temperature: half-degree bytes, clipped, 255 = no data",
+      [None if b == 255 else b / 2 - 60 for b in tb] == [-60, -15.5, 0, 0, 21.5, 67, None], str(tb))
+check("temperature codes round half up, no '-0', convert to F",
+      [B.mt_temp_code(c) for c in (-0.3, 0.5, -0.5, -9.0, None)] == ["0", "1", "0", "-9", "-"]
+      and [B.mt_temp_code(c, "F") for c in (-40, 0, -15.5, 21.5)] == ["-40", "32", "4", "71"])
+
 mm = np.array([0, 0.04, 0.3, 0.5, 4.2, 10, 12.4, 37, 200, np.nan])
 dec = [None if b == 255 else b / 10 if b <= 100 else b - 90 for b in M.enc_precip(mm)]
 check("precip: encode/decode", dec[:8] == [0, 0, 0.3, 0.5, 4.2, 10, 12, 37] and dec[8] == 164 and dec[9] is None, str(dec))
@@ -62,9 +71,9 @@ NC = 6
 LEVH = np.array([110, 540, 990, 1460, 1950, 2470, 3010, 3590, 4210, 4880], dtype="float32")
 terrain = np.array([1769, 2600, 0, 0, 0, 0], dtype="float32")
 
-def bake(run, wind_fn, temp_fn, precip_fn):
+def bake(run, wind_fn, temp_fn, precip_fn, legacy=False):
     """wind_fn(local_dt) -> (m/s, deg) at 2000 m (speed grows in proportion to height); temp_fn -> sea-level C;
-    precip_fn -> mm."""
+    precip_fn -> mm. legacy=True writes the older record layout without temperatures."""
     cols, times, wind = [], [], []
     for t, fh, w in M.plan_steps(run):
         lt = t.astimezone(PT)
@@ -74,11 +83,13 @@ def bake(run, wind_fn, temp_fn, precip_fn):
             sp, dr = wind_fn(lt)
             S = sp * Hs / 2000                                # linear in height: 1x at 2000 m, 1.5x at 3000 m
             D = np.full_like(Hs, dr)
-        cols += M.step_columns(Hs, T, S if w else None, D if w else None,
-                               np.full(NC, precip_fn(lt)) if (w and fh >= M.PRECIP_H) else None)
+        sc = M.step_columns(Hs, T, S if w else None, D if w else None,
+                            np.full(NC, precip_fn(lt)) if (w and fh >= M.PRECIP_H) else None)
+        nh = len(M.HEIGHTS)
+        cols += sc[:2 * nh] + sc[3 * nh:] if legacy else sc
         times.append(t.strftime("%Y-%m-%dT%H:%M:%SZ")); wind.append(w)
     rec = np.stack([M.enc_scaled(terrain, M.TERRAIN_M)] + cols, axis=1)
-    step_len = 2 * len(M.HEIGHTS) + 2
+    step_len = 2 * len(M.HEIGHTS) + 2 if legacy else M.STEP_LEN
     man = {"run": run.strftime("%Y-%m-%dT%H:%M:%SZ"), "steps": times, "wind": wind, "heights_m": M.HEIGHTS,
            "tz": M.TZ, "steps_local": [dt.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC).astimezone(PT).strftime("%Y-%m-%dT%H") for t in times],
            "step_len": step_len, "record_len": 1 + len(times) * step_len, "precip_hours": M.PRECIP_H,
@@ -97,33 +108,52 @@ def temp(lt):           # freezing level peaks at 14:00: 1200 m at 14h, lower ei
 def rain(lt):
     return {4: 0.0, 8: 0.2, 12: 3.4, 16: 12.0, 20: 0.0}[lt.hour]
 
+import re
+def split(text):
+    """-> (header lines, [(wind line, temperature line or None)]) of an mt reply."""
+    L = text.split("\n")
+    first = next(j for j, l in enumerate(L) if re.match(r"\d\d ", l))
+    blocks, j = [], first
+    while j < len(L):
+        nxt = L[j + 1] if j + 1 < len(L) and not re.match(r"\d\d ", L[j + 1]) else None
+        blocks.append((L[j], nxt)); j += 2 if nxt is not None else 1
+    return L[:first], blocks
+
 LAT, LON = 51.25, -124.0                                        # cell 0
 mt18, calls = bake(dt.datetime(2026, 11, 16, 18, tzinfo=UTC), tue_wind, temp, rain)
 five_pm = dt.datetime(2026, 11, 16, 17, 0, tzinfo=PT)
 out = B.build_mt_reply(mt18, LAT, LON, 17, now=five_pm)
 print(out[0]); print(f"({len(out[0])} chars)")
-L = out[0].split("\n")
-check("5 pm the day before: one message, 3 header lines + 5 slots", len(out) == 1 and len(L) == 8)
-check("line 1: point and run, as wx", L[0] == "51.25,-124.00 18Z", L[0])
-check("line 2: day and freezing-level max from the 14:00 sample", L[1] == "Tu17 FZmax1200", L[1])
-check("line 3: elevations", L[2] == "2000/3000m", L[2])
-check("slots are 04 08 12 16 20", [l[:2] for l in L[3:]] == ["04", "08", "12", "16", "20"])
-check("wind: 2000 m and 3000 m, km/h, from SW", L[3].split()[1] == "SW16/SW24" and L[7].split()[1] == "SW24/SW36", L[3] + " | " + L[7])
-check("precip: 0, trace, whole mm", [l.split()[2] for l in L[3:]] == ["0", "T", "3", "12", "0"], str(L[3:]))
-check("no line wraps on a 20-character screen", max(len(l) for l in L) <= B.MT_LINE, str([len(l) for l in L]))
-check("fits one inReach message", len(out[0]) <= 160)
+hd, bl = split(out[0])
+check("5 pm the day before: one message, 3 header lines + 5 two-line slots",
+      len(out) == 1 and len(hd) == 3 and len(bl) == 5 and all(t is not None for w, t in bl))
+check("line 1: point and run, as wx", hd[0] == "51.25,-124.00 18Z", hd[0])
+check("line 2: day and freezing-level max from the 14:00 sample", hd[1] == "Tu17 FZmax1200", hd[1])
+check("line 3: elevations and the default unit C", hd[2] == "2000/3000m C", hd[2])
+check("slots are 04 08 12 16 20", [w[:2] for w, t in bl] == ["04", "08", "12", "16", "20"])
+check("wind: 2000 m and 3000 m, km/h, from SW", bl[0][0].split()[1] == "SW16/SW24" and bl[4][0].split()[1] == "SW24/SW36", str(bl))
+check("precip: 0, trace, whole mm", [w.split()[2] for w, t in bl] == ["0", "T", "3", "12", "0"])
+check("temperature under each slot, whole degrees C at both elevations",
+      [t for w, t in bl] == ["-9/-15", "-7/-14", "-6/-12", "-6/-12", "-7/-14"], str([t for w, t in bl]))
+check("no line wraps on a 20-character screen", max(len(l) for l in out[0].split("\n")) <= B.MT_LINE)
+check("fits one inReach message", len(out[0]) <= 160, str(len(out[0])))
 check("one Range read of one record", len(calls) == 1 and calls[0][1] == 0 and calls[0][2] == mt18.rec_len)
 
-mt06, _ = bake(dt.datetime(2026, 11, 17, 6, tzinfo=UTC), tue_wind, temp, rain)   # the run held at 4:30 am
+out = B.build_mt_reply(mt18, LAT, LON, 17, now=five_pm, unit="F")
+hd, bl = split(out[0])
+check("Fahrenheit: unit on line 3, converted temperatures", hd[2] == "2000/3000m F" and bl[0][1] == "16/4", out[0])
+check("Fahrenheit: same layout and still one message", len(bl) == 5 and len(out[0]) <= 160)
+
+mt06, _ = bake(dt.datetime(2026, 11, 17, 6, tzinfo=UTC), tue_wind, temp, rain)   # a run held early on the day
 out = B.build_mt_reply(mt06, LAT, LON, 17, now=dt.datetime(2026, 11, 17, 4, 30, tzinfo=PT))
-L = out[0].split("\n")
-check("4:30 am on the day: still all five slots incl. 04", [l[:2] for l in L[3:]] == ["04", "08", "12", "16", "20"], out[0])
-check("4:30 am on the day: 06Z run in header", L[0].endswith(" 06Z") and L[1].startswith("Tu17 "))
+hd, bl = split(out[0])
+check("4:30 am on the day: still all five slots incl. 04", [w[:2] for w, t in bl] == ["04", "08", "12", "16", "20"], out[0])
+check("4:30 am on the day: 06Z run in header", hd[0].endswith(" 06Z") and hd[1].startswith("Tu17 "))
 
 out = B.build_mt_reply(mt06, LAT, LON, 17, now=dt.datetime(2026, 11, 17, 13, 10, tzinfo=PT))
-L = out[0].split("\n")
-check("today at 13:10: most recent slot and those ahead", [l[:2] for l in L[3:]] == ["12", "16", "20"], out[0])
-check("today at 13:10: freezing max still sees 14:00", "FZmax1200" in L[1], L[1])
+hd, bl = split(out[0])
+check("today at 13:10: most recent slot and those ahead", [w[:2] for w, t in bl] == ["12", "16", "20"], out[0])
+check("today at 13:10: freezing max still sees 14:00", "FZmax1200" in hd[1], hd[1])
 out = B.build_mt_reply(mt06, LAT, LON, 17, now=dt.datetime(2026, 11, 17, 18, 0, tzinfo=PT))
 check("today at 18:00: freezing max only over what is left", "FZmax1100" in out[0], out[0])
 
@@ -135,42 +165,65 @@ check("yesterday's date is refused", out[0].startswith("No mt forecast for day 1
 check("refusals fit one message", len(out[0]) <= 160)
 
 out = B.build_mt_reply(mt18, LAT, LON, 17, [1500, 2500, 3500], now=five_pm)
-L = out[0].split("\n"); print(out[0]); print(f"({len(out[0])} chars)")
-check("custom elevations: below model terrain shows '-' and the ground height",
-      L[1] == "Tu17 FZmax1200" and L[2] == "1500/2500/3500m gnd1760" and L[3].split()[1].startswith("-/SW"), L[2] + " | " + L[3])
-check("custom elevations: interpolated between 500 m heights", L[3].split()[1] == "-/SW20/SW28", L[3])
-check("three elevations fit one message", len(out[0]) <= 160)
+print(out[0]); print(f"({len(out[0])} chars)")
+hd, bl = split(out[0])
+check("three elevations: gnd moves to its own line when line 3 would pass 20",
+      hd[2] == "1500/2500/3500m C" and hd[3] == "gnd1760", str(hd))
+check("three elevations: day's low and high instead of per-slot lines",
+      hd[4] == "Lo -/-12/-19" and hd[5] == "Hi -/-8/-15" and all(t is None for w, t in bl), str(hd))
+check("three elevations: interpolated wind, '-' below model terrain", bl[0][0].split()[1] == "-/SW20/SW28", bl[0][0])
+check("three elevations: fits one message, earliest slots kept",
+      len(out[0]) <= 160 and bl[0][0].startswith("04 ") and max(len(l) for l in out[0].split("\n")) <= B.MT_LINE, str(len(out[0])))
 
 out = B.build_mt_reply(mt18, 51.25, -123.95, 17, now=five_pm)   # cell 1: terrain 2600 m
-check("default 2000 m below terrain at a high cell", out[0].split("\n")[3].split()[1].startswith("-/SW") and out[0].split("\n")[2] == "2000/3000m gnd2600", out[0])
+hd, bl = split(out[0])
+check("default 2000 m below terrain at a high cell: gnd fits on line 3",
+      hd[2] == "2000/3000m C gnd2600" and bl[0][0].split()[1].startswith("-/SW") and bl[0][1].startswith("-/"), out[0])
 check("outside the region", B.build_mt_reply(mt18, 49.0, -120.0, 17, now=five_pm)[0].startswith("49.00,-120.00 is outside the mt forecast area"))
 
 gale, _ = bake(dt.datetime(2026, 11, 16, 18, tzinfo=UTC), lambda lt: (30.0, 247.5), temp, lambda lt: 25.0)
+out = B.build_mt_reply(gale, LAT, LON, 17, now=five_pm)
+print(out[0]); print(f"({len(out[0])} chars)")
+hd, bl = split(out[0])
+check("two elevations in a gale: cut to <= 160, earliest slots kept with their temperatures",
+      len(out[0]) <= 160 and bl[0][0].startswith("04 ") and all(t for w, t in bl), str(len(out[0])))
 out = B.build_mt_reply(gale, LAT, LON, 17, [2000, 3000, 4000], now=five_pm)
 print(out[0]); print(f"({len(out[0])} chars)")
-check("worst case (3 elevations, 3-digit winds, 2-digit rain) is cut to <= 160", len(out[0]) <= 160, str(len(out[0])))
-check("worst case keeps the earliest slots", out[0].split("\n")[3].startswith("04 "))
+check("three elevations in a gale: cut to <= 160, earliest slots kept",
+      len(out[0]) <= 160 and split(out[0])[1][0][0].startswith("04 "), str(len(out[0])))
 
 breeze, _ = bake(dt.datetime(2026, 11, 16, 18, tzinfo=UTC), lambda lt: (9.0, 247.5), temp, lambda lt: 14.0)
 out = B.build_mt_reply(breeze, LAT, LON, 17, [2000, 3000, 4000], now=five_pm)
 print(out[0]); print(f"({len(out[0])} chars)")
 check("a slot line over 20 characters falls back to the 8-point compass",
-      "WSW" not in out[0] and max(len(l) for l in out[0].split("\n")[3:]) <= B.MT_LINE, out[0])
+      "WSW" not in out[0] and max(len(l) for l in out[0].split("\n")) <= B.MT_LINE, out[0])
 
 lost, _ = bake(dt.datetime(2026, 11, 16, 0, tzinfo=UTC), tue_wind, temp, rain)   # stale run: ends Tue 16:00
 out = B.build_mt_reply(lost, LAT, LON, 17, now=five_pm)
 check("missed ingest: the slot beyond the run shows '-'", out[0].split("\n")[-1] == "20 -", out[0])
 
+old, _ = bake(dt.datetime(2026, 11, 16, 18, tzinfo=UTC), tue_wind, temp, rain, legacy=True)
+out = B.build_mt_reply(old, LAT, LON, 17, now=five_pm, unit="F")
+hd, bl = split(out[0])
+check("older bake without temperatures: previous format, no unit, same winds",
+      hd[2] == "2000/3000m" and all(t is None for w, t in bl) and bl[0][0] == "04 SW16/SW24 0"
+      and "FZmax1200" in hd[1], out[0])
+
 # ------------------------------------------------------------------ request parsing
 GARMIN = "\n\nView the location or send a reply to Dave: https://inreachlink.com/ABC123\n\nDave sent this message from: Lat 50.123456 Lon -125.654321\n"
 P = B.parse_request
-check("mt DAY uses the device GPS", P("mt 17" + GARMIN) == (50.123456, -125.654321, "mt", 17, []))
-check("mt17 without a space", P("Mt17" + GARMIN) == (50.123456, -125.654321, "mt", 17, []))
-check("mt LAT LON DAY", P("mt 51.23 -123.90 17") == (51.23, -123.9, "mt", 17, []))
-check("longitude minus optional", P("mt 51.23 123.90 17") == (51.23, -123.9, "mt", 17, []))
-check("elevations", P("mt 51.23 -123.90 17 2500 3500") == (51.23, -123.9, "mt", 17, [2500, 3500]))
-check("elevations with GPS, m suffix and slash", P("mt 17 2500m/3500m" + GARMIN) == (50.123456, -125.654321, "mt", 17, [2500, 3500]))
-check("inReach keyboard '51. 23'", P("mt 51. 23 -123. 9 17") == (51.23, -123.9, "mt", 17, []))
+check("mt DAY uses the device GPS", P("mt 17" + GARMIN) == (50.123456, -125.654321, "mt", 17, [], "C"))
+check("mt17 without a space", P("Mt17" + GARMIN) == (50.123456, -125.654321, "mt", 17, [], "C"))
+check("mt LAT LON DAY", P("mt 51.23 -123.90 17") == (51.23, -123.9, "mt", 17, [], "C"))
+check("longitude minus optional", P("mt 51.23 123.90 17") == (51.23, -123.9, "mt", 17, [], "C"))
+check("elevations", P("mt 51.23 -123.90 17 2500 3500") == (51.23, -123.9, "mt", 17, [2500, 3500], "C"))
+check("elevations with GPS, m suffix and slash", P("mt 17 2500m/3500m" + GARMIN) == (50.123456, -125.654321, "mt", 17, [2500, 3500], "C"))
+check("inReach keyboard '51. 23'", P("mt 51. 23 -123. 9 17") == (51.23, -123.9, "mt", 17, [], "C"))
+check("F picks Fahrenheit, any case, anywhere after mt",
+      P("mt 17 F" + GARMIN)[5] == "F" and P("mt 51.23 -123.90 17 2500 3500 f")[5] == "F"
+      and P("mt 17F" + GARMIN)[5] == "F" and P("mt F 17" + GARMIN)[3:] == (17, [], "F"))
+check("C is accepted and is the default", P("mt 17 C" + GARMIN)[5] == "C" and P("mt 17" + GARMIN)[5] == "C")
+check("C and F together rejected", P("mt 17 C F" + GARMIN) == "mt-help")
 check("date is mandatory", P("mt" + GARMIN) == "mt-help" and P("mt 51.23 -123.90") == "mt-help")
 check("two dates rejected", P("mt 17 18" + GARMIN) == "mt-help")
 check("elevation out of range rejected", P("mt 17 8000" + GARMIN) == "mt-help" and P("mt 17 400" + GARMIN) == "mt-help")
