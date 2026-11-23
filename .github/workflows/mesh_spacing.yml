@@ -1,0 +1,32 @@
+name: SSCOFS mesh spacing check (manual)
+
+# One-off diagnostic for the water-depth plan (Unified_Map_Dev_Reference.md §7): how finely does the
+# SSCOFS FVCOM mesh resolve the shallow flats and banks, and how much do they dry over the tide?
+# Read-only: no R2, no secrets, nothing uploaded except the result as a workflow artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours:
+        description: "forecast hours of water level to read (24 ≈ two tidal cycles)"
+        default: "24"
+      sites:
+        description: "comma-separated site keys from mesh_spacing_check.py (blank = all)"
+        default: ""
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install numpy
+      - name: Measure mesh spacing over shallow sites
+        run: python mesh_spacing_check.py --hours "${{ github.event.inputs.hours }}" --sites "${{ github.event.inputs.sites }}" --json mesh_spacing.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesh-spacing
+          path: mesh_spacing.json
