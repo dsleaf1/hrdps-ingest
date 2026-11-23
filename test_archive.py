@@ -2,6 +2,7 @@
 """Offline regression tests for archive_util (Model Replay step 1) against an
 in-memory S3 stub. Run: python test_archive.py — prints PASS/FAIL per case."""
 import io, gzip, json, datetime as dt
+import numpy as np
 import archive_util as au
 
 UTC = dt.timezone.utc
@@ -111,12 +112,44 @@ au.archive_obs_snapshot(s3, B, "2026-07-16T06:25:00Z", obs)   # same-t re-run
 obs16 = json.loads(gzip.decompress(s3.store["archive/obs/20260716.json"]))
 check("obs: snapshots append, same-timestamp re-run dedupes", len(obs16["snaps"]) == 2)
 
+# ---------- water level archiving ----------
+def wl_blob(val, n=4):
+    return np.array([val] * n, dtype="<i2").tobytes()
+r1 = dt.datetime(2026, 7, 16, 21, tzinfo=UTC)
+ms1 = [int((r1 + dt.timedelta(hours=h)).timestamp() * 1000) for h in range(14)]
+w = au.archive_water_level(s3, B, r1, ms1, [wl_blob(100 + h) for h in range(14)], 4, "sha-a")
+check("water_level: hours past lead 12 are dropped", sum(w.values()) == 13)
+wl_side = json.loads(gzip.decompress(s3.store["archive/water_level/20260716.json"]))
+wl_day = gzip.decompress(s3.store["archive/water_level/20260716.bin"])
+check("water_level: day file is 24 fixed slots", len(wl_day) == 24 * 8)
+check("water_level: unwritten slot is the dry sentinel",
+      np.frombuffer(wl_day[0:8], "<i2").tolist() == [au.WL_DRY] * 4 and wl_side["src"][0] is None)
+check("water_level: slot 21Z holds hour 0 of the run",
+      np.frombuffer(wl_day[21 * 8:22 * 8], "<i2").tolist() == [100] * 4)
+r2 = dt.datetime(2026, 7, 17, 3, tzinfo=UTC)
+ms2 = [int((r2 + dt.timedelta(hours=h)).timestamp() * 1000) for h in range(3)]
+au.archive_water_level(s3, B, r2, ms2, [wl_blob(-5)] * 3, 4, "sha-a")
+d17 = gzip.decompress(s3.store["archive/water_level/20260717.bin"])
+check("water_level: fresher run wins the overlapping slot",
+      np.frombuffer(d17[3 * 8:4 * 8], "<i2").tolist() == [-5] * 4)
+au.archive_water_level(s3, B, r1, ms1, [wl_blob(7)] * 14, 4, "sha-a")
+d17 = gzip.decompress(s3.store["archive/water_level/20260717.bin"])
+check("water_level: older run does not overwrite a fresher slot",
+      np.frombuffer(d17[3 * 8:4 * 8], "<i2").tolist() == [-5] * 4)
+au.archive_water_level(s3, B, r2, ms2, [wl_blob(1, n=5)] * 3, 5, "sha-b")
+s17 = json.loads(gzip.decompress(s3.store["archive/water_level/20260717.json"]))
+check("water_level: changed node list reinitializes the day",
+      s17["n"] == 5 and s17["nodes_sha1"] == "sha-b" and s17["src"][4] is not None and s17["src"][9] is None)
+s3.store["archive/water_level/nodes.bin"] = b"static"
+
 # ---------- index ----------
 idx = au.update_index(s3, B)
 check("index: wind dates per region",
       set(idx["wind"]["test-region"]) == {"20260716", "20260717"})
 check("index: current + obs days listed",
       set(idx["current"]) == {"20260716", "20260717"} and set(idx["obs"]) == {"20260716"})
+check("index: water-level days listed",
+      set(idx.get("water_level", {})) == {"20260716", "20260717"})
 check("index: sizes are stored bytes",
       idx["wind"]["test-region"]["20260716"] == len(s3.store["archive/wind/test-region/20260716.bin"]))
 
@@ -133,6 +166,9 @@ check("prune: old day objects removed",
       and "archive/wind/test-region/20260716.json" not in s3.store
       and "archive/current/20260716.json" not in s3.store
       and "archive/obs/20260716.json" not in s3.store)
+check("prune: old water-level day removed, static node list kept",
+      "archive/water_level/20260716.bin" not in s3.store
+      and "archive/water_level/nodes.bin" in s3.store)
 check("prune: flagged full-run capture untouched",
       "archive/wind/full/20260716/2026-07-16T12:00:00Z/test-region.bin" in s3.store)
 idx = json.loads(gzip.decompress(s3.store["archive/index.json"]))

@@ -9,6 +9,9 @@ archive/ in the same R2 bucket:
   archive/wind/<region>/<YYYYMMDD>.json  sidecar: dims + per-slot source run
   archive/current/<YYYYMMDD>.json        SSCOFS station series per run (valid <= run+6h)
   archive/obs/<YYYYMMDD>.json            hourly obs snapshots
+  archive/water_level/<YYYYMMDD>.bin     SSCOFS water level + dry flag at shallow mesh nodes
+                                         (24 UTC slots, best lead; written by sscofs_mesh.py)
+  archive/water_level/nodes.bin          static: which nodes, where, model depth h (never pruned)
   archive/index.json                     season manifest, rebuilt from a bucket LIST
 
 Stitching rule everywhere: freshest run wins on overlap. For wind that happens at
@@ -57,6 +60,15 @@ FORMATS = {
                 "to valid <= run+6h (nowcast + best-lead forecast), points filed under their "
                 "valid UTC date; where runs overlap an hour, take the newest run."),
     "obs": "{v, date, snaps: [{t, stations: [obs.py station records]}, ...]} hourly snapshots",
+    "water_level_bin": ("24 UTC hour slots (00..23Z), fixed size. Per slot: n int16 little-endian "
+                        "SSCOFS water level zeta in cm at the archived nodes, in the order of "
+                        "archive/water_level/nodes.bin. -32768 = node dry at that hour (FVCOM "
+                        "wet_nodes = 0) or slot never written (see sidecar src). Total depth at a "
+                        "node = h + zeta, both in the model's own vertical datum."),
+    "water_level_sidecar": "{v, date, n, nodes_sha1, unit: 'cm', dry: -32768, src: [24 x run ISO | null]}",
+    "water_level_nodes": ("archive/water_level/nodes.bin: n records of <i4 global node id (0-based), "
+                          "<f4 lon, <f4 lat, <f4 h (m, positive down). Sidecar nodes.json "
+                          "{v, n, h_max_m, sha1}. Static; rewritten only if the selection changes."),
 }
 
 def _noop(*a, **k): pass
@@ -265,6 +277,53 @@ def archive_current_field(s3, bucket, run, hours_ms, overview_blob, meta, lead_h
         log(f"  archive current_field {date}: {wrote}/{len(slots)} slots from run {run_iso}")
     return written
 
+WL_DRY = -32768
+
+def archive_water_level(s3, bucket, run, hours_ms, slot_blobs, n, nodes_sha1, lead_hours=12, log=_noop):
+    """Retain SSCOFS water level at the archived shallow nodes in stitched best-lead day
+    files, mirroring archive_current_field. slot_blobs[i] = n int16 LE (cm, WL_DRY = dry)
+    for forecast hour i, valid at hours_ms[i]; entries may stop early (only hours <=
+    lead_hours are needed). nodes_sha1 ties every day file to the node list it indexes:
+    a changed list reinitializes the day rather than mixing two orders."""
+    nb = 2 * n
+    run_iso = run.strftime("%Y-%m-%dT%H:%M:%SZ")
+    cutoff = run + dt.timedelta(hours=lead_hours)
+    bydate = {}
+    for i, blob in enumerate(slot_blobs):
+        vt = dt.datetime.fromtimestamp(hours_ms[i] / 1000, UTC)
+        if vt > cutoff or len(blob) != nb:
+            break
+        bydate.setdefault(vt.strftime("%Y%m%d"), []).append((vt.hour, blob))
+    empty = (WL_DRY).to_bytes(2, "little", signed=True) * n
+    written = {}
+    for date, slots in sorted(bydate.items()):
+        bkey = f"archive/water_level/{date}.bin"
+        skey = f"archive/water_level/{date}.json"
+        day = get_gz(s3, bucket, bkey)
+        side = get_json(s3, bucket, skey)
+        if (day is None or side is None or len(day) != 24 * nb
+                or side.get("n") != n or side.get("nodes_sha1") != nodes_sha1):
+            if day is not None:
+                log(f"  archive water_level {date}: node list changed, reinitializing")
+            day = bytearray(empty * 24)
+            side = {"v": V, "date": date, "n": n, "nodes_sha1": nodes_sha1,
+                    "unit": "cm", "dry": WL_DRY, "src": [None] * 24}
+        else:
+            day = bytearray(day)
+        wrote = 0
+        for hour, blob in slots:
+            prev = side["src"][hour]
+            if prev is None or prev <= run_iso:
+                day[hour * nb:(hour + 1) * nb] = blob
+                side["src"][hour] = run_iso
+                wrote += 1
+        if wrote:
+            put_gz(s3, bucket, bkey, bytes(day), "application/octet-stream")
+            put_json(s3, bucket, skey, side)
+        written[date] = wrote
+        log(f"  archive water_level {date}: {wrote}/{len(slots)} slots from run {run_iso}")
+    return written
+
 # ---------- SSCOFS currents (station series) ----------
 def archive_current_run(s3, bucket, run, stationlist, lead_hours=6, log=_noop):
     """File one SSCOFS cycle's station series (valid <= run+lead_hours, i.e. the
@@ -317,6 +376,7 @@ _CUR_RUNS_RE = re.compile(r"^archive/current_runs/([^/]+)/(\d{8})\.bin$")
 _CURFIELD_RE = re.compile(r"^archive/current_field/(\d{8})\.bin$")
 _CUR_RE = re.compile(r"^archive/current/(\d{8})\.json$")
 _OBS_RE = re.compile(r"^archive/obs/(\d{8})\.json$")
+_WL_RE = re.compile(r"^archive/water_level/(\d{8})\.bin$")
 
 def list_archive(s3, bucket):
     """{key: stored_size} for every key under archive/."""
@@ -339,7 +399,7 @@ def update_index(s3, bucket, log=_noop):
     keys = list_archive(s3, bucket)
     wind, wind_runs, wind_runs_1km = {}, {}, {}
     current_runs = {}
-    current_field, current, obs = {}, {}, {}
+    current_field, current, obs, water_level = {}, {}, {}, {}
     for k, size in keys.items():
         m = _WIND_RE.match(k)
         if m:
@@ -368,6 +428,10 @@ def update_index(s3, bucket, log=_noop):
         m = _OBS_RE.match(k)
         if m:
             obs[m.group(1)] = size
+            continue
+        m = _WL_RE.match(k)
+        if m:
+            water_level[m.group(1)] = size
     idx = {"v": V,
            "generated": dt.datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
            "note": "sizes are stored (gzip) bytes; wind sidecar = same path .json",
@@ -377,6 +441,8 @@ def update_index(s3, bucket, log=_noop):
         idx["wind_runs_1km"] = wind_runs_1km
     if current_runs:
         idx["current_runs"] = current_runs
+    if water_level:
+        idx["water_level"] = water_level
     put_json(s3, bucket, "archive/index.json", idx)
     wr_count = sum(len(d) for d in wind_runs.values())
     wr1k_count = sum(len(d) for d in wind_runs_1km.values())
@@ -386,7 +452,8 @@ def update_index(s3, bucket, log=_noop):
         + (f", {wr1k_count} wind-runs-1km day-files" if wr1k_count else "")
         + (f", {cr_count} current-runs day-files" if cr_count else "") +
         f", {len(current_field)} current-field days, {len(current)} current days, "
-        f"{len(obs)} obs days")
+        f"{len(obs)} obs days"
+        + (f", {len(water_level)} water-level days" if water_level else ""))
     return idx
 
 # ---------- prune ----------
@@ -396,7 +463,7 @@ def pinned_dates(s3, bucket):
     raw = get_gz(s3, bucket, "archive/flags.json")
     return set() if raw is None else {m.decode() for m in re.findall(rb"\d{8}", raw)}
 
-_DAY_RE = re.compile(r"^archive/(?:wind(?:_runs(?:_1km)?)?/(?!full/)[^/]+|current_runs/[^/]+|current_field|current|obs)/(\d{8})\.(?:bin|json)$")
+_DAY_RE = re.compile(r"^archive/(?:wind(?:_runs(?:_1km)?)?/(?!full/)[^/]+|current_runs/[^/]+|current_field|current|obs|water_level)/(\d{8})\.(?:bin|json)$")
 
 def prune_days(s3, bucket, before, delete=False, log=_noop):
     """Drop per-day archive objects strictly older than `before` (YYYYMMDD). Never
