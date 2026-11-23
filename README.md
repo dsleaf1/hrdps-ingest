@@ -65,7 +65,10 @@ Alongside the latest-overwrite flow, each job retains the day's data under `arch
 in the same bucket: stitched best-lead wind day files (hours 0–6 of each continental
 run, freshest run wins per UTC hour-slot) for the four protected-water regions,
 SSCOFS station series per cycle (valid ≤ run+6h), hourly obs snapshots, and a derived
-`archive/index.json`. All logic lives in `archive_util.py`; formats and invariants are
+`archive/index.json`. Since 2026-11, `sscofs_mesh.py` also archives SSCOFS water level and
+FVCOM's dry flag at mesh nodes shallower than 25 m (`archive/water_level/<date>.bin`, hours
+0–12 of each cycle, static node list in `archive/water_level/nodes.bin`) — raw material for
+the planned water-depth term in the steepness model. All logic lives in `archive_util.py`; formats and invariants are
 documented in `cape_st_james/Model_Replay_Dev_Reference.md`. `python prune.py --before
 YYYYMMDD [--yes]` drops old days (manual only; refuses flagged dates). Offline tests:
 `python test_archive.py`.

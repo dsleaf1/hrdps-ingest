@@ -11,6 +11,10 @@ Per region (elements whose centroid falls in the bbox):
   - per-cycle vel    -> R2 sscofs/meshvel/{region}.bin  per hour: n_elem speed bytes (kt*10,
     255=dry) then n_elem dir bytes (toward-bearing*255/360); offset = h*2*n_elem
   - sscofs/meshvel/manifest.json {run,hours[ms],speed_unit,dir_convention,regions{key:{n_elem,file,mesh}}}
+  - season archive (upload runs only): water level + FVCOM dry flag at mesh nodes shallower than
+    WL_HMAX_M, forecast hours 0..WL_LEAD_H, stitched best-lead into archive/water_level/<date>.bin
+    (archive_util.archive_water_level). Raw material for the planned water-depth term in the
+    steepness model, so replay can test it on past days. Static node list: archive/water_level/nodes.bin.
 
 Velocity fetched via .dods binary (5x smaller than ascii). Needs numpy.
 Local test:  python sscofs_mesh.py --hours 2 --regions puget-sound --no-upload
@@ -22,6 +26,8 @@ import numpy as np
 OPENDAP="https://opendap.co-ops.nos.noaa.gov/thredds/dodsC/NOAA/SSCOFS/MODELS"
 S3="https://noaa-nos-ofs-pds.s3.amazonaws.com"
 KT=1.94384
+WL_HMAX_M=25.0     # archive water level only where the model depth h is shallower than this
+WL_LEAD_H=12       # archive hours 0..12, as archive_current_field does
 
 REGIONS={
  # bboxes overlap neighbours by >=0.05 deg so lazily-loaded tiles have no seam
@@ -90,6 +96,17 @@ def main():
         reg_elems[key]=elems
         log(f"  {key}: {len(elems)} elements")
 
+    # ---- shallow nodes for the water-level archive (all regions, not just --regions) ----
+    hb=dods(f0,"h[0:239733]")                                    # bathymetry (m, positive down)
+    in_any=np.zeros(len(clon),bool)
+    for W,S,E,N in REGIONS.values(): in_any|=(clon>=W)&(clon<=E)&(clat>=S)&(clat<=N)
+    wl_nodes=np.unique(nv[:,in_any].ravel()); wl_nodes=wl_nodes[hb[wl_nodes]<WL_HMAX_M]
+    wl_rec=np.zeros(len(wl_nodes),dtype=[("id","<i4"),("lon","<f4"),("lat","<f4"),("h","<f4")])
+    wl_rec["id"]=wl_nodes; wl_rec["lon"]=lon[wl_nodes]; wl_rec["lat"]=lat[wl_nodes]; wl_rec["h"]=hb[wl_nodes]
+    wl_bytes=wl_rec.tobytes()
+    import hashlib; wl_sha=hashlib.sha1(wl_bytes).hexdigest()
+    log(f"water-level archive: {len(wl_nodes)} nodes with h < {WL_HMAX_M:g} m (node list sha1 {wl_sha[:12]})")
+
     s3=bucket=None
     if not a.no_upload:
         import boto3
@@ -125,6 +142,7 @@ def main():
     hrs=list(range(a.hours+1))
     hours_ms=[int((run+dt.timedelta(hours=h)).timestamp()*1000) for h in hrs]
     velbuf={k:bytearray() for k in keys}
+    wl_slots=[]
     for h in hrs:
         fu=f"{base}.fields.f{h:03d}.nc"
         u=dods(fu,"u[0][0][0:433409]"); v=dods(fu,"v[0][0][0:433409]")
@@ -135,6 +153,15 @@ def main():
         for k in keys:
             e=reg_elems[k]; velbuf[k]+=sb[e].tobytes()+db[e].tobytes()
         log(f"  f{h:03d}: max {spd.max():.1f} kt")
+        if h<=WL_LEAD_H:
+            z=dods(fu,"zeta[0][0:239733]")[wl_nodes]
+            try: wet=dods(fu,"wet_nodes[0][0:239733]",">i4")[wl_nodes]
+            except Exception as ex:
+                if h==0: log(f"  wet_nodes unreadable ({ex}); archiving zeta without a dry flag")
+                wet=np.ones(len(wl_nodes),dtype=np.int64)
+            cm=np.clip(np.round(z*100),-32767,32767).astype("<i2")
+            cm[(wet==0)|~np.isfinite(z)|(np.abs(z)>100)]=-32768
+            wl_slots.append(cm.tobytes())
 
     manifest={"model":"SSCOFS surface current (native FVCOM mesh)","run":run.strftime("%Y-%m-%dT%H:%M:%SZ"),
               "generated":dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -144,9 +171,27 @@ def main():
         json.dump(manifest,open("mesh_out/manifest.json","w"),indent=1)
         for k in keys: open(f"mesh_out/{k}.bin","wb").write(bytes(velbuf[k]))
         log("wrote ./mesh_out")
+        open("mesh_out/water_level_nodes.bin","wb").write(wl_bytes)
+        open("mesh_out/water_level_slots.bin","wb").write(b"".join(wl_slots))
+        raw=sum(len(b) for b in wl_slots); gz=len(gzip.compress(b"".join(wl_slots)))
+        dry=sum(int((np.frombuffer(b,"<i2")==-32768).sum()) for b in wl_slots)
+        log(f"water level: {len(wl_slots)} slots x {len(wl_nodes)} nodes, {raw} B raw / {gz} B gz "
+            f"(~{gz/max(len(wl_slots),1)*24/1e6:.2f} MB/day gz), {dry} dry node-hours")
     else:
         put("sscofs/meshvel/manifest.json",json.dumps(manifest,separators=(",",":")).encode(),"application/json")
         for k in keys: put(f"sscofs/meshvel/{k}.bin",bytes(velbuf[k]),"application/octet-stream")
         log(f"uploaded meshvel manifest + {len(keys)} region velocity bins")
+        # Season archive (Model Replay invariant 6): unwrapped on purpose — a failure must fail
+        # the job and alert, as in sscofs.py; the raw archive is the irreplaceable layer.
+        import archive_util as au
+        side=au.get_json(s3,bucket,"archive/water_level/nodes.json")
+        if not side or side.get("sha1")!=wl_sha:
+            au.put_gz(s3,bucket,"archive/water_level/nodes.bin",wl_bytes,"application/octet-stream",max_age=86400)
+            au.put_json(s3,bucket,"archive/water_level/nodes.json",
+                        {"v":au.V,"n":int(len(wl_nodes)),"h_max_m":WL_HMAX_M,"sha1":wl_sha})
+            log(f"  wrote archive/water_level/nodes.bin ({len(wl_nodes)} nodes)")
+        au.archive_water_level(s3,bucket,run,hours_ms,wl_slots,len(wl_nodes),wl_sha,
+                               lead_hours=WL_LEAD_H,log=log)
+        au.update_index(s3,bucket,log=log)
 
 if __name__=="__main__": main()
