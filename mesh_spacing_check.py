@@ -11,8 +11,8 @@ Per site it reports:
   mesh    elements, median / p10 / p90 element edge length (m), "elements across" = √(site area)/edge,
           and the share of the site box the mesh covers (low ⇒ drying ground cut out of the mesh as land)
   depth   h percentiles (m, FVCOM convention: positive DOWN from the model datum; negative = above datum,
-          i.e. intertidal ground that only floods at higher water). UNIFORM flags a site whose h barely
-          varies — a depth floor or fill value, not surveyed bathymetry.
+          i.e. intertidal ground that only floods at higher water). UNIFORM flags a site where at least half
+          the elements sit within 0.1 m of the median depth — a depth floor or fill value, not surveyed bathymetry.
   tide    zeta range, the share of elements whose total depth d = h + ζ falls below 3 m / 1 m at some
           hour, the share that DRY at some hour, and the shallowest d reached (FVCOM keeps a thin film of
           water on dry elements, so that minimum is its dry depth, not zero)
@@ -52,7 +52,8 @@ SITES = {
 BAKE_DEG = 0.005          # steep_bake.mjs cell size
 R_EARTH = 6371000.0
 DRY_FALLBACK_M = 0.20     # used only when the file has no wet/dry flag
-UNIFORM_M = 0.2           # h p90 − p10 below this ⇒ UNIFORM
+UNIFORM_M = 0.1           # an element within this of the site median counts as "at the median"
+UNIFORM_SHARE = 0.5       # ≥ this share of elements at the median ⇒ UNIFORM (a floor/fill value, not bathymetry)
 
 def pct(a, q): return float(np.percentile(a, q)) if len(a) else float("nan")
 
@@ -142,7 +143,8 @@ def main():
         dmin = (h[tri] + zmin[idx]).min(0)                       # shallowest total depth reached over the hours
         dry = dry_ever[loc_e[e]] if flag else (dmin <= DRY_FALLBACK_M)
         frac = lambda m: float(np.mean(m))
-        uniform = (pct(he, 90) - pct(he, 10)) < UNIFORM_M
+        share_at_median = frac(np.abs(he - np.median(he)) < UNIFORM_M)
+        uniform = share_at_median >= UNIFORM_SHARE
         # 0.005° bake cells over the site
         ci = np.floor((clon[e] - W) / BAKE_DEG).astype(int); cj = np.floor((clat[e] - S) / BAKE_DEG).astype(int)
         nci, ncj = max(1, math.ceil((E - W) / BAKE_DEG)), max(1, math.ceil((N - S) / BAKE_DEG))
@@ -156,7 +158,7 @@ def main():
                  elements_across=round(math.sqrt(box_area) / edge, 1),
                  mesh_cover_of_box=round(mesh_area / box_area, 3),
                  h_p10=round(pct(he, 10), 2), h_median=round(pct(he, 50), 2), h_p90=round(pct(he, 90), 2),
-                 h_min=round(float(he.min()), 2), h_uniform=bool(uniform),
+                 h_min=round(float(he.min()), 2), h_uniform=bool(uniform), share_h_at_median=round(share_at_median, 3),
                  share_h_below_datum=round(frac(he < 0), 3),
                  zeta_range_m=round(zr, 2),
                  share_ever_below_1m=round(frac(dmin < 1), 3), share_ever_below_3m=round(frac(dmin < 3), 3),
@@ -164,7 +166,7 @@ def main():
                  bake_cells=nci * ncj, bake_cells_without_element=nci * ncj - len(cells),
                  bake_cells_multi_element=int(len(multi)), bake_cells_mixed=int(mixed))
         out["sites"][k] = r
-        hcol = f"{r['h_median']:.1f} / {r['h_p10']:.1f} / {r['h_min']:.1f}" + (" **UNIFORM**" if uniform else "")
+        hcol = f"{r['h_median']:.1f} / {r['h_p10']:.1f} / {r['h_min']:.1f}" + (f" **UNIFORM** ({100*share_at_median:.0f}% at median)" if uniform else "")
         rows.append(f"| {k} | {r['elements']} | {r['edge_m_median']:.0f} ({r['edge_m_p10']:.0f}–{r['edge_m_p90']:.0f}) | "
                     f"{r['elements_across']:.0f} | {100*r['mesh_cover_of_box']:.0f}% | {hcol} | "
                     f"{100*r['share_h_below_datum']:.0f}% | {r['zeta_range_m']:.2f} | "
